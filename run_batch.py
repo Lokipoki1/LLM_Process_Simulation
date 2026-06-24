@@ -47,10 +47,17 @@ def main():
 
     # Exportar resultados
     ctrl.export_json("simulation.json")
-    ctrl.export_xes("simulation.xes")
+    if ctrl._event_log:
+        ctrl.export_xes("simulation.xes")
+    else:
+        print("  [WARN] Sin entradas en el event log — XES no generado.")
 
     # Resumen en consola
     df = ctrl.summary_dataframe()
+    if df.empty:
+        print("\n  Sin casos completados exitosamente.\n")
+        return
+
     print("\n  Resumen por caso:")
     print(df.to_string(index=False))
 

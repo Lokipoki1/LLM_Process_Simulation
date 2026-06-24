@@ -157,8 +157,10 @@ class SimulationController:
                 elif status == "rejected": rejected += 1
                 print(f"-> {status.upper():8s} | {result.n_actions} acciones | {dur:.1f}s")
             except Exception as e:
+                import traceback
                 errors += 1
                 print(f"-> ERROR: {e}")
+                traceback.print_exc()  # imprime el traceback completo en consola
             if i % 10 == 0:
                 self._save_partial(i)
 
