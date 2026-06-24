@@ -10,6 +10,7 @@ from __future__ import annotations
 from functools import partial
 from langchain_ollama import ChatOllama
 from langgraph.graph import StateGraph, START, END
+from langgraph.graph.state import CompiledStateGraph
 
 from ..state import ProcessState
 from ..agents.junior_clerk import JuniorClerk
@@ -69,7 +70,7 @@ def build_graph(
     ollama_base_url: str = "http://localhost:11434",
     clock: SimulationClock | None = None,
     temp_tools: float = 0.1,
-) -> "CompiledGraph":
+) -> CompiledStateGraph:
     if clock is None:
         clock = SimulationClock()
 
