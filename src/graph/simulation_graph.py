@@ -1,10 +1,12 @@
 """
-simulation_graph.py — v3
-Soporta OpenAI (gpt-4o-mini) y Ollama segun variables de entorno.
+simulation_graph.py — v4 (autonomous agents)
+─────────────────────────────────────────────
+Grafo simplificado: un solo LLM, routing basado en next_agent.
+Los agentes deciden su propia secuencia via tool calls.
 """
 
 from __future__ import annotations
-import os
+import logging
 from functools import partial
 from langgraph.graph import StateGraph, START, END
 
@@ -15,11 +17,12 @@ from ..agents.credit_officer import CreditOfficer
 from ..observer.observer import observer_node
 from ..clock.simulation_clock import SimulationClock
 
-MAX_STEPS = 15
+logger = logging.getLogger("bps.graph")
+
+MAX_STEPS = 20  # safety net
 
 
 def _build_llm(model: str, base_url: str, temperature: float):
-    """Instancia el LLM correcto segun el modelo configurado."""
     if model.startswith("gpt-"):
         from langchain_openai import ChatOpenAI
         return ChatOpenAI(model=model, temperature=temperature)
@@ -29,28 +32,31 @@ def _build_llm(model: str, base_url: str, temperature: float):
 
 
 def route(state: ProcessState) -> str:
+    # 1. Caso cerrado
     if state["status"] in ("approved", "rejected"):
         return END
-    if len(state["agent_history"]) >= MAX_STEPS:
-        print(f"  [WARN] MAX_STEPS ({MAX_STEPS}) alcanzado — forzando END")
+
+    # 2. Safety net
+    steps = len(state["agent_history"])
+    if steps >= MAX_STEPS:
+        logger.warning("MAX_STEPS (%d) reached — forcing END", MAX_STEPS)
         return END
 
     next_agent = state.get("next_agent")
     current    = state.get("current_agent", "junior_clerk")
 
-    # SC explicitly sent the case back to JC for a revision cycle → increment counter
+    # 3. SC envía caso de vuelta al JC → incrementar revisión
     if next_agent == "junior_clerk":
         return "jc_revision"
 
-    # Explicit handoff to other agents
+    # 4. Handoff explícito a otro agente
     if next_agent in ("senior_clerk", "credit_officer"):
         return next_agent
 
-    # next_agent is None: agent is continuing its own sequence (or LLM skipped a tool call)
-    if current == "junior_clerk":
-        return "jc_step"    # stay in JC without touching revision_count
-    if current in ("senior_clerk", "credit_officer"):
-        return current      # retry the same agent
+    # 5. Agente continúa su propia secuencia (next_agent is None, status not terminal)
+    if current in ("junior_clerk", "senior_clerk", "credit_officer"):
+        return current
+
     return END
 
 
@@ -59,21 +65,19 @@ def increment_revision(state: ProcessState) -> dict:
 
 
 def build_graph(
-    model: str           = "gpt-4o-mini",
+    model: str           = "llama3.1",
     ollama_base_url: str = "http://localhost:11434",
     clock: SimulationClock | None = None,
-    temp_tools: float    = 0.1,
-    temp_cognitive: float = 0.7,
+    temp_tools: float    = 0.3,
 ) -> "CompiledGraph":
     if clock is None:
         clock = SimulationClock()
 
-    llm_proc   = _build_llm(model, ollama_base_url, temp_tools)
-    llm_cog    = _build_llm(model, ollama_base_url, temp_cognitive)
-    llm_sc_cog = _build_llm(model, ollama_base_url, 0.4)   # SC: lower temp → more selective
-    junior  = JuniorClerk(llm_proc, llm_cog)
-    senior  = SeniorClerk(llm_proc, llm_sc_cog)
-    officer = CreditOfficer(llm_proc, llm_cog)
+    llm = _build_llm(model, ollama_base_url, temp_tools)
+
+    junior  = JuniorClerk(llm)
+    senior  = SeniorClerk(llm)
+    officer = CreditOfficer(llm)
     obs     = partial(observer_node, clock=clock)
 
     builder = StateGraph(ProcessState)
@@ -91,11 +95,11 @@ def build_graph(
     builder.add_conditional_edges(
         "observer", route,
         {
-            "jc_revision":    "increment_revision",  # SC sent case back → count the revision
-            "jc_step":        "junior_clerk",         # JC own sequence → no increment
-            "senior_clerk":   "senior_clerk",
-            "credit_officer": "credit_officer",
-            END:              END,
+            "junior_clerk":    "junior_clerk",
+            "jc_revision":     "increment_revision",
+            "senior_clerk":    "senior_clerk",
+            "credit_officer":  "credit_officer",
+            END:               END,
         },
     )
     builder.add_edge("increment_revision", "junior_clerk")

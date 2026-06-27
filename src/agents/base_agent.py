@@ -1,8 +1,9 @@
 """
-base_agent.py — v3
-Cada agente determina deterministicamente cual tool viene a continuacion.
-El LLM solo aporta el CONTENIDO (notas, decisiones, justificaciones).
-La SECUENCIA la controla el codigo — igual que ChatDev / MetaGPT.
+base_agent.py — v4 (autonomous)
+───────────────────────────────
+Cada agente recibe TODAS sus tools y decide la secuencia.
+El SOP vive en el system prompt, no en código.
+El código solo garantiza: Pydantic validation, tool_choice="any", handoff narrativo.
 """
 
 from __future__ import annotations
@@ -27,89 +28,123 @@ class BaseAgent:
     system_prompt: str = "Eres un agente de procesamiento."
     tool_schemas: list[type[BaseModel]] = []
 
-    def __init__(self, llm, llm_cognitive=None):
-        self._base_llm = llm
-        self._cognitive_llm = llm_cognitive or llm
+    def __init__(self, llm):
         self._all_tools = {s.__name__: s for s in self.tool_schemas}
+        # Bind ALL tools at once — the agent chooses which to call
+        lc_tools = [
+            StructuredTool.from_function(
+                func=_make_tool_func(s),
+                name=s.__name__,
+                description=s.__doc__ or s.__name__,
+                args_schema=s,
+            )
+            for s in self.tool_schemas
+        ]
+        self._llm = llm.bind_tools(lc_tools, tool_choice="any")
 
-    def _bind_single_tool(self, schema: type[BaseModel]):
-        """Vincula UNA tool al LLM y fuerza su uso (tool_choice=any)."""
-        lc_tool = StructuredTool.from_function(
-            func=_make_tool_func(schema),
-            name=schema.__name__,
-            description=schema.__doc__ or schema.__name__,
-            args_schema=schema,
-        )
-        # tool_choice="any" forces the LLM to always call a tool, eliminating
-        # text-only responses on procedural steps ("sin tool call" retries).
-        return self._base_llm.bind_tools([lc_tool], tool_choice="any")
+    # ── Handoff narrativo ─────────────────────────────────────
 
-    def _get_agent_step(self, state: ProcessState) -> int:
-        """Cuantas veces ha actuado ESTE agente en el caso actual."""
-        return sum(1 for a in state["agent_history"] if a["agent_name"] == self.name)
-
-    def _get_next_tool_schema(self, state: ProcessState) -> type[BaseModel]:
+    def _build_handoff_context(self, state: ProcessState) -> str:
         """
-        Subclases DEBEN sobrescribir esto.
-        Devuelve el schema Pydantic de la tool que corresponde en este paso.
+        Construye el resumen narrativo de lo que hicieron los agentes anteriores.
+        Esto es la "interacción entre agentes" de la tesis:
+        cada agente lee el RAZONAMIENTO del anterior, no solo un dict.
         """
-        raise NotImplementedError
+        lines = []
+        for action in state["agent_history"]:
+            agent   = action["agent_name"].replace("_", " ").title()
+            tool    = action["tool_name"]
+            output  = action["tool_output"]
 
-    def _build_context_message(self, state: ProcessState, tool_schema: type[BaseModel]) -> str:
+            # Extraer el razonamiento narrativo de cada acción
+            notes = (
+                output.get("initial_notes")
+                or output.get("notes")
+                or output.get("validation_notes")
+                or output.get("risk_summary")
+                or output.get("assessment_notes")
+                or output.get("approval_notes")
+                or output.get("rejection_notes")
+                or output.get("reason")
+                or output.get("details")
+                or ""
+            )
+            summary = f"{agent} ejecutó {tool}"
+            if notes:
+                summary += f": \"{notes[:200]}\""
+
+            # Añadir datos clave del output
+            if "recommendation" in output:
+                summary += f" [recomendación: {output['recommendation']}]"
+            if "document_status" in output:
+                summary += f" [docs: {output['document_status']}]"
+            if "risk_category" in output:
+                summary += f" [riesgo: {output['risk_category']}]"
+            if "debt_to_income_ratio" in output:
+                summary += f" [ratio verificado: {output['debt_to_income_ratio']:.2f}]"
+
+            lines.append(summary)
+
+        return "\n".join(lines) if lines else "Ninguna acción previa."
+
+    def _build_case_context(self, state: ProcessState) -> str:
+        """Construye el contexto completo del caso para el LLM."""
         case = state["case"]
-        step = self._get_agent_step(state)
-        history_summary = ""
-        if state["agent_history"]:
-            lines = [f"  - {a['agent_name']} ejecuto {a['tool_name']}"
-                     for a in state["agent_history"][-6:]]
-            history_summary = "\nAcciones previas:\n" + "\n".join(lines)
+        ratio = case["monthly_cost"] / case["monthly_income"]
+        handoff = self._build_handoff_context(state)
 
         return (
-            f"CASO: {case['case_id']}\n"
-            f"Monto: EUR {case['amount_requested']:,.0f} | Plazo: {case['number_of_terms']} meses\n"
-            f"Cuota mensual: EUR {case['monthly_cost']:,.0f}\n"
-            f"Score crediticio: {case['credit_score']} | Ingreso mensual: EUR {case['monthly_income']:,.0f}\n"
-            f"Ratio deuda/ingreso: {case['monthly_cost']/case['monthly_income']:.2f}\n"
-            f"Estado: {state['status']} | Revisiones: {state['revision_count']}"
-            f"{history_summary}\n\n"
-            f"INSTRUCCION (paso {step+1}): Debes llamar la tool '{tool_schema.__name__}'. "
-            f"Completa todos sus campos con informacion relevante del caso."
+            f"══ CASO ACTIVO ══\n"
+            f"ID: {case['case_id']}\n"
+            f"Monto solicitado: EUR {case['amount_requested']:,.0f}\n"
+            f"Propósito: {case['loan_goal']}\n"
+            f"Plazo: {case['number_of_terms']} meses | Cuota mensual: EUR {case['monthly_cost']:,.0f}\n"
+            f"Score crediticio: {case['credit_score']}\n"
+            f"Ingreso mensual declarado: EUR {case['monthly_income']:,.0f}\n"
+            f"Ratio deuda/ingreso estimado: {ratio:.2f}\n"
+            f"Estado actual: {state['status']}\n"
+            f"Revisiones previas del caso: {state['revision_count']}\n\n"
+            f"══ HISTORIAL DE ACCIONES ══\n"
+            f"{handoff}\n\n"
+            f"══ INSTRUCCIÓN ══\n"
+            f"Elige y ejecuta la tool más apropiada para tu siguiente paso."
         )
 
     def __call__(self, state: ProcessState) -> dict:
-        tool_schema = self._get_next_tool_schema(state)
-        llm_with_tool = self._bind_single_tool(tool_schema)
-
-        messages = [
-            SystemMessage(content=self.system_prompt),
-            *state["messages"][-6:],  # ventana de contexto limitada
-            {"role": "user", "content": self._build_context_message(state, tool_schema)},
-        ]
-
         _log = logging.getLogger(f"bps.{self.name}")
         case_id = state["case"]["case_id"]
 
-        response: AIMessage = llm_with_tool.invoke(messages)
+        messages = [
+            SystemMessage(content=self.system_prompt),
+            {"role": "user", "content": self._build_case_context(state)},
+        ]
+
+        response: AIMessage = self._llm.invoke(messages)
 
         if not response.tool_calls:
-            _log.warning("%s | no tool call for %s — retrying", case_id, tool_schema.__name__)
+            _log.warning("%s | no tool call — retrying", case_id)
             return {
-                "messages":      [response],
+                "messages": [response],
                 "current_agent": self.name,
-                "next_agent":    None,
+                "next_agent": None,
             }
 
-        tool_call  = response.tool_calls[0]
-        tool_name  = tool_call["name"]
-        tool_args  = tool_call["args"]
+        tool_call = response.tool_calls[0]
+        tool_name = tool_call["name"]
+        tool_args = tool_call["args"]
 
-        schema_cls  = self._all_tools.get(tool_name, tool_schema)
+        # Validar con Pydantic — el único control hard que mantenemos
+        schema_cls = self._all_tools.get(tool_name)
         tool_output = {}
-        try:
-            tool_output = schema_cls(**tool_args).model_dump()
-        except Exception as e:
-            tool_output = {"error": str(e)}
-            _log.error("%s | validation error in %s: %s", case_id, tool_name, e)
+        if schema_cls:
+            try:
+                tool_output = schema_cls(**tool_args).model_dump()
+            except Exception as e:
+                tool_output = {"error": str(e)}
+                _log.error("%s | validation error in %s: %s", case_id, tool_name, e)
+        else:
+            _log.warning("%s | unknown tool %s", case_id, tool_name)
+            tool_output = tool_args
 
         action: AgentAction = {
             "agent_name":    self.name,
@@ -125,18 +160,20 @@ class BaseAgent:
             tool_call_id=tool_call["id"],
         )
 
-        _log.debug(
-            "%s | %s | args: %s",
-            case_id, tool_name,
-            {k: (str(v)[:80] if isinstance(v, str) else v) for k, v in tool_args.items()},
+        next_agent = self._resolve_next_agent(tool_name, tool_args, state)
+        status = self._resolve_status(tool_name, tool_args)
+
+        _log.info(
+            "%s | %s | next=%s | status=%s",
+            case_id, tool_name, next_agent or "self", status,
         )
 
         return {
             "messages":      [response, tool_message],
             "agent_history": [action],
             "current_agent": self.name,
-            "next_agent":    self._resolve_next_agent(tool_name, tool_args, state),
-            "status":        self._resolve_status(tool_name, tool_args),
+            "next_agent":    next_agent,
+            "status":        status,
         }
 
     def _resolve_next_agent(self, tool_name: str, tool_args: dict, state: ProcessState) -> str | None:
