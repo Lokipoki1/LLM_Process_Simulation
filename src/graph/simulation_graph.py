@@ -38,12 +38,19 @@ def route(state: ProcessState) -> str:
     next_agent = state.get("next_agent")
     current    = state.get("current_agent", "junior_clerk")
 
-    if next_agent in ("junior_clerk", "senior_clerk", "credit_officer"):
+    # SC explicitly sent the case back to JC for a revision cycle → increment counter
+    if next_agent == "junior_clerk":
+        return "jc_revision"
+
+    # Explicit handoff to other agents
+    if next_agent in ("senior_clerk", "credit_officer"):
         return next_agent
-    if current in ("junior_clerk", "senior_clerk", "credit_officer"):
-        print(f"  [INFO] Sin tool call — reintentando {current} "
-              f"(paso {len(state['agent_history'])}/{MAX_STEPS})")
-        return current
+
+    # next_agent is None: agent is continuing its own sequence (or LLM skipped a tool call)
+    if current == "junior_clerk":
+        return "jc_step"    # stay in JC without touching revision_count
+    if current in ("senior_clerk", "credit_officer"):
+        return current      # retry the same agent
     return END
 
 
@@ -56,14 +63,17 @@ def build_graph(
     ollama_base_url: str = "http://localhost:11434",
     clock: SimulationClock | None = None,
     temp_tools: float    = 0.1,
+    temp_cognitive: float = 0.7,
 ) -> "CompiledGraph":
     if clock is None:
         clock = SimulationClock()
 
-    llm     = _build_llm(model, ollama_base_url, temp_tools)
-    junior  = JuniorClerk(llm)
-    senior  = SeniorClerk(llm)
-    officer = CreditOfficer(llm)
+    llm_proc   = _build_llm(model, ollama_base_url, temp_tools)
+    llm_cog    = _build_llm(model, ollama_base_url, temp_cognitive)
+    llm_sc_cog = _build_llm(model, ollama_base_url, 0.4)   # SC: lower temp → more selective
+    junior  = JuniorClerk(llm_proc, llm_cog)
+    senior  = SeniorClerk(llm_proc, llm_sc_cog)
+    officer = CreditOfficer(llm_proc, llm_cog)
     obs     = partial(observer_node, clock=clock)
 
     builder = StateGraph(ProcessState)
@@ -81,7 +91,8 @@ def build_graph(
     builder.add_conditional_edges(
         "observer", route,
         {
-            "junior_clerk":   "increment_revision",
+            "jc_revision":    "increment_revision",  # SC sent case back → count the revision
+            "jc_step":        "junior_clerk",         # JC own sequence → no increment
             "senior_clerk":   "senior_clerk",
             "credit_officer": "credit_officer",
             END:              END,

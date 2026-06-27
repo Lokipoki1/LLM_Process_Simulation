@@ -6,11 +6,14 @@ Fix: si el LLM alucina AssessRisk en paso 2, se ignora y se fuerza decision.
 """
 
 from __future__ import annotations
+import logging
 from langchain_core.messages import SystemMessage, AIMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from ..tools.schemas import AssessRisk, ApproveLoan, RejectLoan
 from ..state import ProcessState, AgentAction
 from .base_agent import BaseAgent, _make_tool_func
+
+logger = logging.getLogger("bps.credit_officer")
 
 SYSTEM_PROMPT = """
 Eres el Dr. Müller, Credit Officer con 10 años de experiencia. Perfil conservador.
@@ -94,7 +97,7 @@ class CreditOfficer(BaseAgent):
             },
         ]
 
-        response: AIMessage = self._base_llm.bind_tools(lc_tools).invoke(messages)
+        response: AIMessage = self._cognitive_llm.bind_tools(lc_tools).invoke(messages)
 
         # ── Sin tool call o tool incorrecta → fallback basado en criterios ──
         tool_call = None
@@ -106,6 +109,14 @@ class CreditOfficer(BaseAgent):
 
         if tool_call is None:
             # Fallback determinista: aplicar criterios del sistema prompt
+            if response.tool_calls:
+                logger.warning(
+                    "%s | [GUARD] LLM called %s in step 2 — ignoring, forcing decision",
+                    case["case_id"], response.tool_calls[0]["name"],
+                )
+            else:
+                logger.warning("%s | [FALLBACK] no tool call — applying deterministic criteria", case["case_id"])
+
             if case["credit_score"] < 580 or ratio > 0.50:
                 tool_name = "RejectLoan"
                 tool_args = {
@@ -114,7 +125,7 @@ class CreditOfficer(BaseAgent):
                         f"Score crediticio insuficiente: {case['credit_score']}",
                         f"Ratio deuda/ingreso excesivo: {ratio:.2f}",
                     ],
-                    "rejection_notes": "Rechazado por criterios de riesgo mínimos.",
+                    "rejection_notes": "Rechazado por criterios de riesgo minimos.",
                 }
             else:
                 rate = 0.04 if case["credit_score"] > 720 else \
@@ -125,7 +136,7 @@ class CreditOfficer(BaseAgent):
                     "approved_amount": case["amount_requested"],
                     "interest_rate":   rate,
                     "conditions":      [],
-                    "approval_notes":  "Aprobado por criterios de riesgo estándar (fallback).",
+                    "approval_notes":  "Aprobado por criterios de riesgo estandar (fallback).",
                 }
         else:
             tool_name = tool_call["name"]
@@ -149,6 +160,20 @@ class CreditOfficer(BaseAgent):
         tool_msg_content = str(tool_output)
         tc_id = tool_call["id"] if tool_call else "fallback"
         tool_message = ToolMessage(content=tool_msg_content, tool_call_id=tc_id)
+
+        if tool_name == "ApproveLoan":
+            logger.info(
+                "%s | [COGNITIVE] ApproveLoan | amount=%.0f | rate=%.1f%% | conditions=%s",
+                case["case_id"],
+                tool_args.get("approved_amount", 0),
+                tool_args.get("interest_rate", 0) * 100,
+                tool_args.get("conditions", []),
+            )
+        else:
+            logger.info(
+                "%s | [COGNITIVE] RejectLoan | reasons=%s",
+                case["case_id"], tool_args.get("rejection_reasons", []),
+            )
 
         return {
             "messages":      [response, tool_message],

@@ -5,6 +5,7 @@ Orquesta la ejecucion de N casos a traves del grafo LangGraph.
 """
 
 from __future__ import annotations
+import logging
 import time
 import json
 import numpy as np
@@ -14,7 +15,10 @@ from dataclasses import dataclass, field
 
 from .graph.simulation_graph import build_graph, make_initial_state
 from .clock.simulation_clock import SimulationClock, extract_bpic_distributions
+from .logger import setup_logging
 from .state import LoanCase
+
+logger = logging.getLogger("bps.controller")
 
 
 LOAN_GOALS = ["car", "home_improvement", "debt_consolidation", "education", "other"]
@@ -97,6 +101,7 @@ class SimulationController:
         sim_start_ts:    str       = "2012-01-02T08:00:00",
         seed:            int       = 42,
         output_dir:      str       = "output",
+        verbose:         bool      = False,
     ):
         self.n_cases         = n_cases
         self.model           = model
@@ -108,6 +113,7 @@ class SimulationController:
         self.output_dir.mkdir(exist_ok=True)
         self._results:   list[CaseResult] = []
         self._event_log: list[dict]       = []
+        setup_logging(output_dir=str(self.output_dir), verbose=verbose)
 
     def _prepare_cases(self) -> list[LoanCase]:
         if self.bpic_xes_path and Path(self.bpic_xes_path).exists():
@@ -137,8 +143,13 @@ class SimulationController:
         approved = rejected = errors = 0
 
         for i, case in enumerate(cases, 1):
+            ratio = case["monthly_cost"] / case["monthly_income"]
             print(f"  [{i:3d}/{self.n_cases}] {case['case_id']} | "
                   f"EUR {case['amount_requested']:>8,.0f} | score {case['credit_score']}", end=" ", flush=True)
+            logger.info(
+                "%s | START | EUR %.0f | score %d | ratio %.2f | goal=%s",
+                case["case_id"], case["amount_requested"], case["credit_score"], ratio, case["loan_goal"],
+            )
             t0 = time.time()
             try:
                 final = graph.invoke(make_initial_state(case), config={"recursion_limit": 40})
@@ -155,12 +166,19 @@ class SimulationController:
                 self._event_log.extend(final["event_log"])
                 if status == "approved":   approved += 1
                 elif status == "rejected": rejected += 1
+                path = "->".join(e["concept_name"] for e in final["event_log"])
+                logger.info(
+                    "%s | END | %s | revisions=%d | events=%d | %.1fs | path: %s",
+                    case["case_id"], status.upper(), final["revision_count"],
+                    len(final["event_log"]), dur, path,
+                )
                 print(f"-> {status.upper():8s} | {result.n_actions} acciones | {dur:.1f}s")
             except Exception as e:
                 import traceback
                 errors += 1
+                logger.error("%s | ERROR: %s", case["case_id"], e, exc_info=True)
                 print(f"-> ERROR: {e}")
-                traceback.print_exc()  # imprime el traceback completo en consola
+                traceback.print_exc()
             if i % 10 == 0:
                 self._save_partial(i)
 

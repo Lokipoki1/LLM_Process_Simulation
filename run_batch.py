@@ -25,6 +25,7 @@ def parse_args():
     p.add_argument("--model",   type=str, default=None, help="Modelo Ollama (default: variable de entorno)")
     p.add_argument("--seed",    type=int, default=42,   help="Semilla aleatoria (default: 42)")
     p.add_argument("--output",  type=str, default="output", help="Carpeta de salida (default: output/)")
+    p.add_argument("--verbose", action="store_true",    help="Imprime debug log en consola ademas del archivo")
     return p.parse_args()
 
 def main():
@@ -40,6 +41,7 @@ def main():
         bpic_xes_path=args.bpic,
         seed=args.seed,
         output_dir=args.output,
+        verbose=args.verbose,
     )
 
     # Correr simulacion

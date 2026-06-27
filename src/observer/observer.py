@@ -19,6 +19,7 @@ TOOL_TO_ACTIVITY: dict[str, str] = {
     "IntakeApplication":       "A_INTAKE",
     "CheckDocuments":          "A_CHECK_DOCS",
     "ForwardCase":             "A_FORWARD",
+    "ReturnApplicationEarly":  "O_RETURNED",
     "ValidateApplication":     "A_VALIDATE",
     "RequestAdditionalInfo":   "A_REQUEST_INFO",
     "EscalateCase":            "A_ESCALATE",

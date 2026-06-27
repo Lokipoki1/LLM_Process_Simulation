@@ -27,23 +27,24 @@ from scipy import stats
 # ─────────────────────────────────────────────────────────────────
 
 DEFAULT_DISTRIBUTIONS: dict[str, tuple[float, float]] = {
-    # Junior Clerk
-    "intake_application":   (7.5, 0.8),   # ~1800s ≈ 30 min
-    "check_documents":      (7.8, 0.7),   # ~2400s ≈ 40 min
-    "forward_case":         (6.2, 0.5),   # ~490s  ≈ 8 min
+    # Junior Clerk — keyed by tool class name (PascalCase)
+    "IntakeApplication":      (7.5, 0.8),   # ~1800s ≈ 30 min
+    "CheckDocuments":         (7.8, 0.7),   # ~2400s ≈ 40 min
+    "ForwardCase":            (6.2, 0.5),   # ~490s  ≈ 8 min
+    "ReturnApplicationEarly": (6.0, 0.4),   # ~400s  ≈ 7 min
 
     # Senior Clerk
-    "validate_application": (8.5, 0.9),   # ~4900s ≈ 80 min
-    "request_info":         (9.2, 1.0),   # ~9900s ≈ 165 min (espera respuesta)
-    "escalate_case":        (6.5, 0.5),   # ~665s  ≈ 11 min
+    "ValidateApplication":    (8.5, 0.9),   # ~4900s ≈ 80 min
+    "RequestAdditionalInfo":  (9.2, 1.0),   # ~9900s ≈ 165 min (espera respuesta)
+    "EscalateCase":           (6.5, 0.5),   # ~665s  ≈ 11 min
 
     # Credit Officer
-    "assess_risk":          (9.0, 0.8),   # ~8100s ≈ 135 min
-    "approve_loan":         (7.2, 0.6),   # ~1300s ≈ 22 min
-    "reject_loan":          (7.0, 0.6),   # ~1100s ≈ 18 min
+    "AssessRisk":             (9.0, 0.8),   # ~8100s ≈ 135 min
+    "ApproveLoan":            (7.2, 0.6),   # ~1300s ≈ 22 min
+    "RejectLoan":             (7.0, 0.6),   # ~1100s ≈ 18 min
 
     # Fallback para actividades no reconocidas
-    "_default":             (7.5, 1.0),
+    "_default":               (7.5, 1.0),
 }
 
 

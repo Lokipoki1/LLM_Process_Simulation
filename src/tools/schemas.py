@@ -181,13 +181,27 @@ class RejectLoan(BaseModel):
     rejection_notes: str = Field(max_length=500)
 
 
+class ReturnApplicationEarly(BaseModel):
+    """
+    Devuelve la solicitud al solicitante sin procesar.
+    Usado por Junior Clerk cuando el caso no cumple requisitos mínimos:
+    documentación fraudulenta, score < 480, o ratio deuda/ingreso > 0.70.
+    """
+    case_id: str
+    return_reason: str = Field(
+        description="'incomplete_docs' | 'fraudulent_docs' | 'below_minimum_score' | 'excessive_ratio'",
+        pattern="^(incomplete_docs|fraudulent_docs|below_minimum_score|excessive_ratio)$",
+    )
+    details: str = Field(max_length=400)
+
+
 # ─────────────────────────────────────────────
 # Registro de tools por agente
 # Usado por los nodos LangGraph para instanciar el LLM con tools correctas
 # ─────────────────────────────────────────────
 
 AGENT_TOOLS: dict[str, list[type[BaseModel]]] = {
-    "junior_clerk":   [IntakeApplication, CheckDocuments, ForwardCase],
+    "junior_clerk":   [IntakeApplication, CheckDocuments, ForwardCase, ReturnApplicationEarly],
     "senior_clerk":   [ValidateApplication, RequestAdditionalInfo, EscalateCase],
     "credit_officer": [AssessRisk, ApproveLoan, RejectLoan],
 }

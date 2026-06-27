@@ -6,10 +6,13 @@ La SECUENCIA la controla el codigo — igual que ChatDev / MetaGPT.
 """
 
 from __future__ import annotations
+import logging
 from langchain_core.messages import SystemMessage, AIMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel
 from ..state import ProcessState, AgentAction
+
+logger = logging.getLogger("bps.base_agent")
 
 
 def _make_tool_func(schema_cls: type[BaseModel]):
@@ -24,19 +27,22 @@ class BaseAgent:
     system_prompt: str = "Eres un agente de procesamiento."
     tool_schemas: list[type[BaseModel]] = []
 
-    def __init__(self, llm):
+    def __init__(self, llm, llm_cognitive=None):
         self._base_llm = llm
+        self._cognitive_llm = llm_cognitive or llm
         self._all_tools = {s.__name__: s for s in self.tool_schemas}
 
     def _bind_single_tool(self, schema: type[BaseModel]):
-        """Vincula solo UNA tool al LLM — elimina ambiguedad de eleccion."""
+        """Vincula UNA tool al LLM y fuerza su uso (tool_choice=any)."""
         lc_tool = StructuredTool.from_function(
             func=_make_tool_func(schema),
             name=schema.__name__,
             description=schema.__doc__ or schema.__name__,
             args_schema=schema,
         )
-        return self._base_llm.bind_tools([lc_tool])
+        # tool_choice="any" forces the LLM to always call a tool, eliminating
+        # text-only responses on procedural steps ("sin tool call" retries).
+        return self._base_llm.bind_tools([lc_tool], tool_choice="any")
 
     def _get_agent_step(self, state: ProcessState) -> int:
         """Cuantas veces ha actuado ESTE agente en el caso actual."""
@@ -80,10 +86,13 @@ class BaseAgent:
             {"role": "user", "content": self._build_context_message(state, tool_schema)},
         ]
 
+        _log = logging.getLogger(f"bps.{self.name}")
+        case_id = state["case"]["case_id"]
+
         response: AIMessage = llm_with_tool.invoke(messages)
 
         if not response.tool_calls:
-            # LLM no uso la tool — devolver sin cambios para reintento
+            _log.warning("%s | no tool call for %s — retrying", case_id, tool_schema.__name__)
             return {
                 "messages":      [response],
                 "current_agent": self.name,
@@ -100,6 +109,7 @@ class BaseAgent:
             tool_output = schema_cls(**tool_args).model_dump()
         except Exception as e:
             tool_output = {"error": str(e)}
+            _log.error("%s | validation error in %s: %s", case_id, tool_name, e)
 
         action: AgentAction = {
             "agent_name":    self.name,
@@ -113,6 +123,12 @@ class BaseAgent:
         tool_message = ToolMessage(
             content=str(tool_output),
             tool_call_id=tool_call["id"],
+        )
+
+        _log.debug(
+            "%s | %s | args: %s",
+            case_id, tool_name,
+            {k: (str(v)[:80] if isinstance(v, str) else v) for k, v in tool_args.items()},
         )
 
         return {
