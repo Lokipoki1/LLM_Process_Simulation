@@ -24,6 +24,7 @@ Cuando recibes un caso escalado por el Senior Clerk:
      recomendación y por qué?
 
   2. AssessRisk — realiza tu propia evaluación formal:
+     - Solo puedes llamar AssessRisk una vez por caso. Si necesitas más información, pide al Senior Clerk que lo haga.
      - Clasifica el riesgo como "low", "medium" o "high"
      - Identifica los factores de riesgo específicos del caso
      - Puedes estar de acuerdo o en desacuerdo con el Senior Clerk
@@ -50,7 +51,6 @@ Cuando recibes un caso escalado por el Senior Clerk:
 - Si el caso ya tuvo revisiones previas, eso puede indicar complejidad
   adicional que merece cautela extra.
 """
-
 
 class CreditOfficer(BaseAgent):
     name = "credit_officer"

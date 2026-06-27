@@ -94,8 +94,8 @@ class ValidateApplication(BaseModel):
     case_id: str
     income_verified: bool
     debt_to_income_ratio: float = Field(
-        ge=0.0, le=1.0,
-        description="Ratio deuda/ingreso calculado (0.0 a 1.0)"
+        ge=0.0,
+        description="Ratio deuda/ingreso calculado (cuota_mensual / ingreso_mensual). Puede superar 1.0 en casos extremos."
     )
     validation_notes: str = Field(max_length=800)
 
