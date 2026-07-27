@@ -30,8 +30,8 @@ class BaseAgent:
 
     def __init__(self, llm):
         self._all_tools = {s.__name__: s for s in self.tool_schemas}
-        # Bind ALL tools at once — the agent chooses which to call
-        lc_tools = [
+        self._base_llm = llm
+        self._all_lc_tools = [
             StructuredTool.from_function(
                 func=_make_tool_func(s),
                 name=s.__name__,
@@ -40,7 +40,23 @@ class BaseAgent:
             )
             for s in self.tool_schemas
         ]
-        self._llm = llm.bind_tools(lc_tools, tool_choice="any")
+
+    def _bind_available_tools(self, state: ProcessState):
+        """
+        Bind tools excluyendo la que se acaba de ejecutar.
+        Esto NO es un guard — no decide QUÉ tool usar, solo impide
+        que el agente repita la misma tool dos veces consecutivas.
+        Equivale al SOP real: un clerk no re-verifica el mismo
+        documento inmediatamente después de verificarlo.
+        """
+        my_actions = [a for a in state["agent_history"] if a["agent_name"] == self.name]
+        last_tool = my_actions[-1]["tool_name"] if my_actions else None
+
+        available = [t for t in self._all_lc_tools if t.name != last_tool]
+        if not available:
+            available = self._all_lc_tools  # fallback: all tools if only one exists
+
+        return self._base_llm.bind_tools(available, tool_choice="any")
 
     # ── Handoff narrativo ─────────────────────────────────────
 
@@ -114,12 +130,31 @@ class BaseAgent:
         _log = logging.getLogger(f"bps.{self.name}")
         case_id = state["case"]["case_id"]
 
+        user_content = self._build_case_context(state)
         messages = [
             SystemMessage(content=self.system_prompt),
-            {"role": "user", "content": self._build_case_context(state)},
+            {"role": "user", "content": user_content},
         ]
 
-        response: AIMessage = self._llm.invoke(messages)
+        _log.debug(
+            "%s | ── PROMPT ──────────────────────────────\n"
+            "SYSTEM:\n%s\n\nUSER:\n%s",
+            case_id, self.system_prompt, user_content,
+        )
+
+        response: AIMessage = self._bind_available_tools(state).invoke(messages)
+
+        usage = getattr(response, "usage_metadata", None) or (
+            response.response_metadata.get("token_usage") if response.response_metadata else None
+        )
+        _log.debug(
+            "%s | ── LLM RESPONSE ────────────────────────\n"
+            "content: %s\ntool_calls: %s\nusage: %s",
+            case_id,
+            response.content or "(empty)",
+            response.tool_calls,
+            usage,
+        )
 
         if not response.tool_calls:
             _log.warning("%s | no tool call — retrying", case_id)
@@ -133,6 +168,8 @@ class BaseAgent:
         tool_name = tool_call["name"]
         tool_args = tool_call["args"]
 
+        _log.debug("%s | ── TOOL INPUT ──────────────────────────\n%s(%s)", case_id, tool_name, tool_args)
+
         # Validar con Pydantic — el único control hard que mantenemos
         schema_cls = self._all_tools.get(tool_name)
         tool_output = {}
@@ -145,6 +182,8 @@ class BaseAgent:
         else:
             _log.warning("%s | unknown tool %s", case_id, tool_name)
             tool_output = tool_args
+
+        _log.debug("%s | ── TOOL OUTPUT ─────────────────────────\n%s", case_id, tool_output)
 
         action: AgentAction = {
             "agent_name":    self.name,

@@ -25,13 +25,33 @@ LOAN_GOALS = ["car", "home_improvement", "debt_consolidation", "education", "oth
 
 
 def generate_synthetic_case(case_id: str, rng: np.random.Generator) -> LoanCase:
-    """Genera un caso sintetico con distribuciones aproximadas al BPIC 2012/2017."""
-    monthly_income   = float(rng.lognormal(mean=8.1, sigma=0.4))
-    amount_requested = float(rng.lognormal(mean=9.8, sigma=0.7))
-    number_of_terms  = int(rng.choice([12, 24, 36, 48, 60, 72]))
-    monthly_cost     = round(amount_requested / number_of_terms * 1.06, 2)
-    credit_score     = int(np.clip(rng.normal(loc=660, scale=80), 300, 850))
-    loan_goal        = str(rng.choice(LOAN_GOALS))
+    """
+    Genera un caso sintético con distribución realista de perfiles.
+    En el BPIC 2012, ~30-40% de solicitudes son rechazadas.
+    Esto requiere generar casos con perfiles variados: buenos, borderline y malos.
+    """
+    # Perfil del caso: 50% bueno, 25% borderline, 25% malo
+    profile = rng.choice(["good", "borderline", "bad"], p=[0.50, 0.25, 0.25])
+
+    if profile == "good":
+        monthly_income   = float(rng.lognormal(mean=8.2, sigma=0.3))   # ~EUR 3600
+        credit_score     = int(np.clip(rng.normal(loc=720, scale=40), 650, 850))
+        amount_requested = monthly_income * rng.uniform(2, 8)           # ratio bajo
+        number_of_terms  = int(rng.choice([36, 48, 60, 72]))
+    elif profile == "borderline":
+        monthly_income   = float(rng.lognormal(mean=7.8, sigma=0.4))   # ~EUR 2400
+        credit_score     = int(np.clip(rng.normal(loc=620, scale=50), 550, 700))
+        amount_requested = monthly_income * rng.uniform(8, 18)          # ratio medio-alto
+        number_of_terms  = int(rng.choice([24, 36, 48]))
+    else:  # bad
+        monthly_income   = float(rng.lognormal(mean=7.5, sigma=0.5))   # ~EUR 1800
+        credit_score     = int(np.clip(rng.normal(loc=530, scale=60), 300, 620))
+        amount_requested = monthly_income * rng.uniform(15, 30)         # ratio alto
+        number_of_terms  = int(rng.choice([12, 24, 36]))
+
+    monthly_cost = round(amount_requested / number_of_terms * 1.06, 2)
+    loan_goal    = str(rng.choice(LOAN_GOALS))
+
     return LoanCase(
         case_id=case_id,
         amount_requested=round(amount_requested, 2),
@@ -178,7 +198,7 @@ class SimulationController:
                 errors += 1
                 logger.error("%s | ERROR: %s", case["case_id"], e, exc_info=True)
                 print(f"-> ERROR: {e}")
-                traceback.print_exc()
+                traceback.print_exc()  # imprime el traceback completo en consola
             if i % 10 == 0:
                 self._save_partial(i)
 

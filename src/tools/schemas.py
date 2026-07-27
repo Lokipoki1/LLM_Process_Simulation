@@ -81,6 +81,19 @@ class ForwardCase(BaseModel):
         pattern="^(normal|high)$",
     )
 
+class ReturnApplicationEarly(BaseModel):
+    """
+    Devuelve la solicitud al solicitante sin procesar.
+    Usado por Junior Clerk cuando el caso no cumple requisitos mínimos:
+    documentación fraudulenta, score < 480, o ratio deuda/ingreso > 0.70.
+    """
+    case_id: str
+    return_reason: str = Field(
+        description="'incomplete_docs' | 'fraudulent_docs' | 'below_minimum_score' | 'excessive_ratio'",
+        pattern="^(incomplete_docs|fraudulent_docs|below_minimum_score|excessive_ratio)$",
+    )
+    details: str = Field(max_length=400)
+
 
 # ─────────────────────────────────────────────
 # Tools del Senior Clerk
@@ -179,20 +192,6 @@ class RejectLoan(BaseModel):
         description="Al menos una razón formal de rechazo"
     )
     rejection_notes: str = Field(max_length=500)
-
-
-class ReturnApplicationEarly(BaseModel):
-    """
-    Devuelve la solicitud al solicitante sin procesar.
-    Usado por Junior Clerk cuando el caso no cumple requisitos mínimos:
-    documentación fraudulenta, score < 480, o ratio deuda/ingreso > 0.70.
-    """
-    case_id: str
-    return_reason: str = Field(
-        description="'incomplete_docs' | 'fraudulent_docs' | 'below_minimum_score' | 'excessive_ratio'",
-        pattern="^(incomplete_docs|fraudulent_docs|below_minimum_score|excessive_ratio)$",
-    )
-    details: str = Field(max_length=400)
 
 
 # ─────────────────────────────────────────────
