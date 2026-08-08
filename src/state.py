@@ -1,8 +1,16 @@
 """
 state.py
 --------
-Define el contrato de datos central del framework.
-Todo nodo de LangGraph lee y escribe sobre este TypedDict.
+Data contracts for the multi-LLM-agent BPS framework.
+
+Information flow mirrors the real BPIC 2017 loan process:
+  - LoanApplication: what the client submits (visible from the start)
+  - CreditBureauData: what the bank discovers during processing
+    (hidden until Senior Clerk calls CheckCreditScore)
+
+This information asymmetry is key to the thesis: agents make
+decisions with different levels of information, just like real
+bank workers.
 """
 
 from __future__ import annotations
@@ -12,101 +20,106 @@ from typing_extensions import TypedDict
 
 
 # ─────────────────────────────────────────────
-# 1. Datos del caso de préstamo
+# 1. Initial application data (client submits this)
+#    BPIC 2017 case-level attributes
 # ─────────────────────────────────────────────
 
-class LoanCase(TypedDict):
+class LoanApplication(TypedDict):
     """
-    Atributos de un caso de préstamo.
-    Los campos reales (amount_requested, etc.) vienen del BPIC 2012/2017.
-    Los campos sintéticos (credit_score, monthly_income) se samplearán
-    con distribuciones estadísticas derivadas del mismo dataset.
+    What the client fills in when applying for a loan.
+    These are the ONLY fields visible to the Junior Clerk.
+
+    All fields come directly from BPIC 2017 case attributes:
+      - case:concept:name     -> case_id
+      - case:RequestedAmount  -> amount_requested
+      - case:LoanGoal         -> loan_goal
+      - case:ApplicationType  -> application_type
     """
     case_id: str
     amount_requested: float
-    loan_goal: str                   # e.g. "car", "home_improvement"
-    number_of_terms: int             # meses
-    monthly_cost: float
-
-    # Campos sintéticos (generados estadísticamente)
-    credit_score: int                # 300–850
-    monthly_income: float
-    applicant_id: str
+    loan_goal: str               # "Car", "Existing loan takeover", etc.
+    application_type: str        # "New credit", "Limit raise", etc.
 
 
 # ─────────────────────────────────────────────
-# 2. Registro de acciones de agentes
+# 2. Credit bureau data (bank discovers this)
+#    BPIC 2017 offer-level attributes
+# ─────────────────────────────────────────────
+
+class CreditBureauData(TypedDict):
+    """
+    Data revealed when the Senior Clerk consults the credit bureau.
+    Hidden from the Junior Clerk — only visible after CheckCreditScore.
+
+    In BPIC 2017 these appear on O_Create Offer events:
+      - CreditScore    -> credit_score
+      - MonthlyCost    -> monthly_cost
+      - NumberOfTerms  -> number_of_terms
+      - OfferedAmount  -> offered_amount
+
+    For cases rejected before the offer stage,
+    credit_score will be None (the bank never checked).
+    """
+    credit_score: Optional[int]
+    monthly_cost: Optional[float]
+    number_of_terms: Optional[int]
+    offered_amount: Optional[float]
+
+
+# ─────────────────────────────────────────────
+# 3. Agent action record
 # ─────────────────────────────────────────────
 
 class AgentAction(TypedDict):
-    """
-    Captura cada tool call que ejecuta un agente.
-    El ObserverModule convierte esto en una entrada XES.
-    """
-    agent_name: str                  # "junior_clerk" | "senior_clerk" | "credit_officer"
-    tool_name: str                   # nombre de la tool Pydantic ejecutada
-    tool_input: dict                 # parámetros con los que se llamó
-    tool_output: dict                # resultado estructurado devuelto
-    sim_timestamp: float             # tiempo lógico de simulación (segundos)
-    real_duration: float             # duración samplea de BPIC (segundos)
+    agent_name: str
+    tool_name: str
+    tool_input: dict
+    tool_output: dict
+    sim_timestamp: float
+    real_duration: float
 
 
 # ─────────────────────────────────────────────
-# 3. Entrada del event log (formato XES)
+# 4. XES event log entry
 # ─────────────────────────────────────────────
 
 class XESEntry(TypedDict):
-    """
-    Estructura mínima compatible con PM4Py / IEEE XES.
-    Nombres de campo exactos que PM4Py espera para importación.
-    """
-    case_concept_name: str           # case:concept:name  → case_id
-    concept_name: str                # concept:name       → nombre de la actividad
-    time_timestamp: str              # time:timestamp     → ISO 8601
-    org_resource: str                # org:resource       → nombre del agente
-    lifecycle_transition: str        # "complete" por defecto
+    case_concept_name: str
+    concept_name: str
+    time_timestamp: str
+    org_resource: str
+    lifecycle_transition: str
 
 
 # ─────────────────────────────────────────────
-# 4. Estado global del proceso (ProcessState)
+# 5. Process state
 # ─────────────────────────────────────────────
 
 class ProcessState(TypedDict):
     """
-    Estado compartido que fluye a través del grafo LangGraph.
+    Shared state for a single loan application case.
 
-    Convención de anotaciones:
-    - Annotated[list, operator.add] → LangGraph hace append automático
-      cuando un nodo devuelve una lista parcial (no reemplaza la lista completa).
-    - Campos sin Annotated → el nodo devuelve el valor nuevo completo.
+    Information asymmetry enforced by the context builder:
+      - Junior Clerk:   sees application only
+      - Senior Clerk:   sees application + credit_bureau_data (after check)
+      - Credit Officer: sees everything + all prior reasoning
     """
+    # Case data
+    application: LoanApplication
+    credit_bureau_data: Optional[dict]    # CreditBureauData, None until loaded
+    credit_checked: bool                  # False until SC calls CheckCreditScore
 
-    # ── Caso activo ──────────────────────────
-    case: LoanCase
-    status: str                      # "pending" | "in_review" | "approved" | "rejected"
-    current_agent: str               # nombre del agente que tiene el turno
+    # Process control
+    status: str
+    current_agent: str
+    rework_count: int
+    rejection_reason: Optional[str]
+    next_agent: Optional[str]
 
-    # ── Memoria conversacional ───────────────
-    # Lista de mensajes LangChain (HumanMessage, AIMessage, ToolMessage).
-    # operator.add hace que cada nodo solo devuelva los mensajes nuevos
-    # y LangGraph los concatena al historial global automáticamente.
+    # Append-only collections
     messages: Annotated[list, operator.add]
-
-    # ── Historial de acciones (append-only) ──
-    # Fuente de verdad para el ObserverModule.
     agent_history: Annotated[list[AgentAction], operator.add]
-
-    # ── Reloj lógico de simulación ───────────
-    # Tiempo en segundos desde el inicio de la simulación.
-    # El ObserverModule lo avanza usando distribuciones del BPIC.
-    sim_clock: float
-
-    # ── Event log (append-only) ──────────────
-    # Se construye en paralelo al agent_history.
-    # Al final de la simulación se exporta a .xes vía PM4Py.
     event_log: Annotated[list[XESEntry], operator.add]
 
-    # ── Control de flujo ─────────────────────
-    revision_count: int              # cuántas veces volvió al Junior Clerk
-    rejection_reason: Optional[str]  # si status == "rejected"
-    next_agent: Optional[str]        # hint de routing para los conditional edges
+    # Simulation clock
+    sim_clock: float

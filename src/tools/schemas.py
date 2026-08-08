@@ -1,15 +1,12 @@
 """
 schemas.py
 ----------
-Schemas Pydantic para las tools de cada agente.
+Pydantic tools for each agent role.
 
-Regla clave: cada tool representa UNA acción atómica del proceso real.
-El agente LLM no puede inventar acciones fuera de este conjunto.
-Esto es el mecanismo de control de alucinaciones de la tesis.
-
-Cada schema hereda de BaseModel de Pydantic v2.
-LangChain los convierte automáticamente en function-calling schemas
-para la API de OpenAI/Anthropic.
+Information asymmetry:
+  - JC tools: work only with application data (amount, goal, type)
+  - SC tools: include CheckCreditScore that reveals bureau data
+  - CO tools: work with full information (application + credit + history)
 """
 
 from __future__ import annotations
@@ -18,9 +15,7 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 
-# ─────────────────────────────────────────────
-# Enums compartidos
-# ─────────────────────────────────────────────
+# ── Shared enums ──────────────────────────────
 
 class DocumentStatus(str, Enum):
     COMPLETE = "complete"
@@ -28,95 +23,105 @@ class DocumentStatus(str, Enum):
     FRAUDULENT = "fraudulent"
 
 
-class CaseDecision(str, Enum):
-    FORWARD = "forward"
-    RETURN_FOR_REVISION = "return_for_revision"
-    REJECT = "reject"
-
-
-# ─────────────────────────────────────────────
-# Tools del Junior Clerk
-# ─────────────────────────────────────────────
+# ── Junior Clerk tools ────────────────────────
+# JC only sees: amount_requested, loan_goal, application_type
+# NO credit score, NO monthly income, NO monthly cost
 
 class IntakeApplication(BaseModel):
     """
-    Registra la recepción inicial de una solicitud de préstamo.
-    Primera acción obligatoria del Junior Clerk en cada caso.
+    Register initial receipt of a loan application.
+    First mandatory action for the Junior Clerk.
     """
-    case_id: str = Field(description="ID del caso de préstamo")
+    case_id: str = Field(description="Loan case ID")
     applicant_acknowledged: bool = Field(
-        description="¿Se ha informado al solicitante de la recepción?"
+        description="Has the applicant been notified of receipt?"
     )
     initial_notes: str = Field(
-        description="Observaciones iniciales del clerk sobre el caso",
+        description="Initial observations based ONLY on requested amount, loan goal, and application type",
         max_length=500,
     )
 
 
 class CheckDocuments(BaseModel):
     """
-    Verifica que la documentación presentada está completa y es válida.
+    Verify that submitted documentation is complete and valid.
     """
     case_id: str
     document_status: DocumentStatus
     missing_documents: list[str] = Field(
         default_factory=list,
-        description="Lista de documentos faltantes si document_status == 'incomplete'",
+        description="List of missing documents if status is 'incomplete'",
     )
     notes: str = Field(default="", max_length=500)
 
 
 class ForwardCase(BaseModel):
     """
-    Envía el caso al Senior Clerk para validación profunda.
-    Solo válido si document_status fue 'complete'.
+    Forward the case to the Senior Clerk for deep validation.
+    Only valid when documentation is acceptable.
     """
     case_id: str
-    forwarded_to: str = Field(
-        default="senior_clerk",
-        description="Destino del caso (siempre 'senior_clerk' en esta versión)"
-    )
+    forwarded_to: str = Field(default="senior_clerk")
     priority: str = Field(
-        description="'normal' | 'high' según criterio del clerk",
+        description="'normal' or 'high' based on amount and case complexity",
         pattern="^(normal|high)$",
     )
 
+
 class ReturnApplicationEarly(BaseModel):
     """
-    Devuelve la solicitud al solicitante sin procesar.
-    Usado por Junior Clerk cuando el caso no cumple requisitos mínimos:
-    documentación fraudulenta, score < 480, o ratio deuda/ingreso > 0.70.
+    Return the application to the applicant without further processing.
+    Used when the case clearly does not meet minimum requirements
+    based on the LIMITED information available to the Junior Clerk.
     """
     case_id: str
     return_reason: str = Field(
-        description="'incomplete_docs' | 'fraudulent_docs' | 'below_minimum_score' | 'excessive_ratio'",
-        pattern="^(incomplete_docs|fraudulent_docs|below_minimum_score|excessive_ratio)$",
+        description="'incomplete_docs' | 'fraudulent_docs' | 'unreasonable_request'",
+        pattern="^(incomplete_docs|fraudulent_docs|unreasonable_request)$",
     )
     details: str = Field(max_length=400)
 
 
-# ─────────────────────────────────────────────
-# Tools del Senior Clerk
-# ─────────────────────────────────────────────
+# ── Senior Clerk tools ────────────────────────
+# SC starts with same info as JC, but can CHECK the credit bureau
+
+class CheckCreditScore(BaseModel):
+    """
+    Consult the credit bureau to obtain the applicant's credit data.
+    This reveals: credit_score, monthly_cost, number_of_terms.
+    MUST be called before ValidateApplication or EscalateCase.
+    """
+    case_id: str
+    bureau_consulted: str = Field(
+        default="national_credit_bureau",
+        description="Which credit bureau was consulted",
+    )
+    check_notes: str = Field(
+        default="",
+        description="Reason for checking or any preliminary observations",
+        max_length=300,
+    )
+
 
 class ValidateApplication(BaseModel):
     """
-    Realiza la validación profunda de la solicitud.
-    Verifica coherencia entre documentos, ingresos y monto solicitado.
+    Deep validation of the application using credit bureau data.
+    Must be called AFTER CheckCreditScore.
     """
     case_id: str
-    income_verified: bool
-    debt_to_income_ratio: float = Field(
-        ge=0.0,
-        description="Ratio deuda/ingreso calculado (cuota_mensual / ingreso_mensual). Puede superar 1.0 en casos extremos."
+    credit_score_acceptable: bool = Field(
+        description="Is the credit score within acceptable range?"
     )
-    validation_notes: str = Field(max_length=800)
+    risk_assessment: str = Field(
+        description="Assessment based on credit score, monthly cost, and loan terms",
+        max_length=800,
+    )
 
 
 class RequestAdditionalInfo(BaseModel):
     """
-    Solicita información adicional al solicitante o al Junior Clerk.
-    Activa un loop de revisión en el grafo.
+    Request additional information from the applicant or Junior Clerk.
+    Triggers a rework loop — the case goes back to the JC.
     """
     case_id: str
     requested_from: str = Field(
@@ -124,18 +129,18 @@ class RequestAdditionalInfo(BaseModel):
         pattern="^(applicant|junior_clerk)$",
     )
     information_needed: list[str] = Field(
-        description="Lista específica de información requerida"
+        description="Specific list of required information"
     )
     reason: str = Field(max_length=500)
 
 
 class EscalateCase(BaseModel):
     """
-    Escala el caso al Credit Officer para decisión final.
+    Escalate the case to the Credit Officer for final decision.
     """
     case_id: str
     risk_summary: str = Field(
-        description="Resumen del perfil de riesgo del solicitante",
+        description="Detailed risk profile based on credit bureau data and validation",
         max_length=800,
     )
     recommendation: str = Field(
@@ -144,63 +149,57 @@ class EscalateCase(BaseModel):
     )
 
 
-# ─────────────────────────────────────────────
-# Tools del Credit Officer
-# ─────────────────────────────────────────────
+# ── Credit Officer tools ─────────────────────
+# CO sees everything: application + credit data + all prior reasoning
 
 class AssessRisk(BaseModel):
     """
-    Evaluación formal de riesgo crediticio.
-    Considera credit score, ratio deuda/ingreso y monto solicitado.
+    Formal credit risk evaluation considering all available data.
     """
     case_id: str
-    credit_score: int = Field(ge=300, le=850)
     risk_category: str = Field(
         description="'low' | 'medium' | 'high'",
         pattern="^(low|medium|high)$",
     )
     risk_factors: list[str] = Field(
-        description="Factores de riesgo identificados"
+        description="Specific risk factors identified"
     )
     assessment_notes: str = Field(max_length=800)
 
 
 class ApproveLoan(BaseModel):
     """
-    Aprueba la solicitud de préstamo con condiciones específicas.
+    Approve the loan application with specific conditions.
     """
     case_id: str
     approved_amount: float = Field(gt=0)
     interest_rate: float = Field(
         ge=0.0, le=1.0,
-        description="Tasa de interés anual (ej: 0.045 para 4.5%)"
+        description="Annual interest rate (e.g. 0.045 for 4.5%%)"
     )
     conditions: list[str] = Field(
         default_factory=list,
-        description="Condiciones adicionales de la aprobación"
+        description="Additional approval conditions"
     )
     approval_notes: str = Field(default="", max_length=500)
 
 
 class RejectLoan(BaseModel):
     """
-    Rechaza la solicitud de préstamo con justificación formal.
+    Reject the loan application with formal justification.
     """
     case_id: str
     rejection_reasons: list[str] = Field(
         min_length=1,
-        description="Al menos una razón formal de rechazo"
+        description="At least one formal rejection reason"
     )
     rejection_notes: str = Field(max_length=500)
 
 
-# ─────────────────────────────────────────────
-# Registro de tools por agente
-# Usado por los nodos LangGraph para instanciar el LLM con tools correctas
-# ─────────────────────────────────────────────
+# ── Tool registry per agent role ──────────────
 
 AGENT_TOOLS: dict[str, list[type[BaseModel]]] = {
     "junior_clerk":   [IntakeApplication, CheckDocuments, ForwardCase, ReturnApplicationEarly],
-    "senior_clerk":   [ValidateApplication, RequestAdditionalInfo, EscalateCase],
+    "senior_clerk":   [CheckCreditScore, ValidateApplication, RequestAdditionalInfo, EscalateCase],
     "credit_officer": [AssessRisk, ApproveLoan, RejectLoan],
 }

@@ -29,7 +29,7 @@ from .agent_pool import AgentPool, AgentWorker, WorkSchedule
 from .process_graph import ProcessStepExecutor, make_initial_state
 from ..observer.observer import build_xes_entry
 from ..clock.simulation_clock import SimulationClock
-from ..state import ProcessState, LoanCase, AgentAction, XESEntry
+from ..state import ProcessState, LoanApplication, AgentAction, XESEntry
 
 logger = logging.getLogger("bps.engine")
 
@@ -190,6 +190,7 @@ class SimulationEngine:
         self._results: list[CaseResult] = []
         self._global_event_log: list[dict] = []
         self._events_processed = 0
+        self._scheduled_shifts: set[str] = set()  # track scheduled shift events
 
         self._build_agent_pool()
 
@@ -273,11 +274,21 @@ class SimulationEngine:
 
     # ── Initial state factory ─────────────────────
 
-    def _make_initial_state(self, case: LoanCase) -> ProcessState:
+    def _make_initial_state(self, case_data: dict) -> ProcessState:
+        application = {
+            "case_id": case_data["case_id"],
+            "amount_requested": case_data["amount_requested"],
+            "loan_goal": case_data["loan_goal"],
+            "application_type": case_data.get("application_type", "New credit"),
+        }
+        credit_data = case_data.get("credit_bureau_data")
         return ProcessState(
-            case=case, status="pending", current_agent="junior_clerk",
+            application=application,
+            credit_bureau_data=credit_data,
+            credit_checked=False,
+            status="pending", current_agent="junior_clerk",
             messages=[], agent_history=[], sim_clock=0.0, event_log=[],
-            revision_count=0, rejection_reason=None, next_agent=None,
+            rework_count=0, rejection_reason=None, next_agent=None,
         )
 
     # ── Event handlers ────────────────────────────
@@ -285,9 +296,7 @@ class SimulationEngine:
     def _handle_arrival(self, event: SimEvent):
         """A new case enters the system → enqueue to junior_clerk."""
         case_id = event.case_id
-        case_data = LoanCase(**event.data)
-
-        state = self._make_initial_state(case_data)
+        state = self._make_initial_state(event.data)
         self._case_states[case_id] = state
         self._case_arrivals[case_id] = event.time
         self._case_queue_time[case_id] = 0.0
@@ -296,10 +305,10 @@ class SimulationEngine:
 
         self._agent_pool.enqueue_case("junior_clerk", case_id)
         logger.info(
-            "%s | ARRIVED | EUR %.0f | score %d | ratio %.2f",
-            case_id, case_data["amount_requested"],
-            case_data["credit_score"],
-            case_data["monthly_cost"] / case_data["monthly_income"],
+            "%s | ARRIVED | EUR %.0f | goal=%s | type=%s",
+            case_id, event.data.get("amount_requested", 0),
+            event.data.get("loan_goal", "?"),
+            event.data.get("application_type", "?"),
         )
         self._try_dispatch_all(event.time)
 
@@ -354,6 +363,28 @@ class SimulationEngine:
             if worker:
                 self._dispatch_step(worker, sim_time)
                 dispatched = True
+
+        # Schedule shift-start events for workers with queued work who are off-shift.
+        # Without this, cases get orphaned when all workers go home.
+        for w in self._agent_pool.get_all_workers():
+            if w.queue and w.is_idle and not w.is_on_shift(sim_time):
+                next_start = w.next_shift_start(sim_time)
+                # Avoid duplicate shift events
+                event_key = f"shift_{w.worker_id}_{next_start:.0f}"
+                if event_key not in self._scheduled_shifts:
+                    self._scheduled_shifts.add(event_key)
+                    self._event_queue.schedule_shift(
+                        time=next_start,
+                        worker_id=w.worker_id,
+                        event_type=EventType.SHIFT_START,
+                    )
+                    logger.debug(
+                        "%s off-shift with %d queued — scheduled shift start at %s",
+                        w.worker_id, len(w.queue),
+                        __import__('datetime').datetime.fromtimestamp(
+                            next_start, tz=__import__('datetime').timezone.utc
+                        ).strftime("%Y-%m-%d %H:%M"),
+                    )
 
     def _dispatch_step(self, worker: AgentWorker, sim_time: float):
         """
@@ -444,7 +475,7 @@ class SimulationEngine:
         result = CaseResult(
             case_id=case_id,
             status=state["status"],
-            rework_count=state["revision_count"],
+            rework_count=state["rework_count"],
             n_steps=self._step_counts.get(case_id, 0),
             n_log_entries=len(state["event_log"]),
             wall_time_s=0.0,  # TODO: track real wall time per case
@@ -459,7 +490,7 @@ class SimulationEngine:
         cycle_time = (sim_time - arrival) / 3600
         logger.info(
             "%s | COMPLETE | %s | reworks=%d | steps=%d | cycle=%.1fh | queue=%.1fh | path: %s",
-            case_id, state["status"].upper(), state["revision_count"],
+            case_id, state["status"].upper(), state["rework_count"],
             self._step_counts.get(case_id, 0),
             cycle_time, self._case_queue_time.get(case_id, 0) / 3600,
             path,
@@ -501,16 +532,32 @@ class SimulationEngine:
                 self._handle_arrival(event)
             elif event.event_type == EventType.STEP_COMPLETE:
                 self._handle_step_complete(event)
+            elif event.event_type == EventType.SHIFT_START:
+                # Worker's shift starts — try to dispatch queued work
+                logger.debug("SHIFT_START for %s", event.worker_id)
+                self._try_dispatch_all(event.time)
 
-            # Progress indicator
+            # Progress: print every completion + periodic heartbeat
             completed = len(self._results)
             total = len(self.cases)
-            if completed > 0 and completed % 5 == 0:
-                last = self._results[-1]
+
+            if completed > 0 and completed != getattr(self, '_last_printed', 0):
+                r = self._results[-1]
                 print(
-                    f"  [{completed:3d}/{total}] {last.case_id} → "
-                    f"{last.status.upper():8s} | {last.n_steps} steps | "
-                    f"cycle {(last.sim_end - last.sim_start)/3600:.1f}h"
+                    f"  [{completed:3d}/{total}] {r.case_id} → "
+                    f"{r.status.upper():8s} | {r.n_steps} steps | "
+                    f"cycle {(r.sim_end - r.sim_start)/3600:.1f}h | "
+                    f"queue {r.queue_time_s/3600:.1f}h"
+                )
+                self._last_printed = completed
+
+            # Heartbeat every 50 events so the user knows it's alive
+            if self._events_processed % 50 == 0:
+                active = total - completed
+                print(
+                    f"    ... {self._events_processed} events processed | "
+                    f"{completed} done | {active} in progress",
+                    flush=True,
                 )
 
         # Print summary

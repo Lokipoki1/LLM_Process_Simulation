@@ -1,9 +1,10 @@
 """
-base_agent.py — v4 (autonomous)
-───────────────────────────────
-Cada agente recibe TODAS sus tools y decide la secuencia.
-El SOP vive en el system prompt, no en código.
-El código solo garantiza: Pydantic validation, tool_choice="any", handoff narrativo.
+base_agent.py — v5 (information asymmetry)
+──────────────────────────────────────────
+Context builder enforces information asymmetry:
+  - JC: sees application data only
+  - SC: sees application + credit bureau data (after CheckCreditScore)
+  - CO: sees everything + all prior reasoning
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ def _make_tool_func(schema_cls: type[BaseModel]):
 
 class BaseAgent:
     name: str = "base_agent"
-    system_prompt: str = "Eres un agente de procesamiento."
+    system_prompt: str = "You are a processing agent."
     tool_schemas: list[type[BaseModel]] = []
 
     def __init__(self, llm):
@@ -42,41 +43,29 @@ class BaseAgent:
         ]
 
     def _bind_available_tools(self, state: ProcessState):
-        """
-        Bind tools excluyendo la que se acaba de ejecutar.
-        Esto NO es un guard — no decide QUÉ tool usar, solo impide
-        que el agente repita la misma tool dos veces consecutivas.
-        Equivale al SOP real: un clerk no re-verifica el mismo
-        documento inmediatamente después de verificarlo.
-        """
+        """Bind tools excluding the one just called (prevents repetition loops)."""
         my_actions = [a for a in state["agent_history"] if a["agent_name"] == self.name]
         last_tool = my_actions[-1]["tool_name"] if my_actions else None
-
         available = [t for t in self._all_lc_tools if t.name != last_tool]
         if not available:
-            available = self._all_lc_tools  # fallback: all tools if only one exists
+            available = self._all_lc_tools
+        return self._base_llm.bind_tools(available)
 
-        return self._base_llm.bind_tools(available, tool_choice="any")
-
-    # ── Handoff narrativo ─────────────────────────────────────
+    # ── Handoff narrative ─────────────────────
 
     def _build_handoff_context(self, state: ProcessState) -> str:
-        """
-        Construye el resumen narrativo de lo que hicieron los agentes anteriores.
-        Esto es la "interacción entre agentes" de la tesis:
-        cada agente lee el RAZONAMIENTO del anterior, no solo un dict.
-        """
+        """Build narrative summary of all prior agent actions."""
         lines = []
         for action in state["agent_history"]:
-            agent   = action["agent_name"].replace("_", " ").title()
-            tool    = action["tool_name"]
-            output  = action["tool_output"]
+            agent  = action["agent_name"].replace("_", " ").title()
+            tool   = action["tool_name"]
+            output = action["tool_output"]
 
-            # Extraer el razonamiento narrativo de cada acción
             notes = (
                 output.get("initial_notes")
                 or output.get("notes")
-                or output.get("validation_notes")
+                or output.get("check_notes")
+                or output.get("risk_assessment")
                 or output.get("risk_summary")
                 or output.get("assessment_notes")
                 or output.get("approval_notes")
@@ -85,76 +74,85 @@ class BaseAgent:
                 or output.get("details")
                 or ""
             )
-            summary = f"{agent} ejecutó {tool}"
+            summary = f"{agent} executed {tool}"
             if notes:
-                summary += f": \"{notes[:200]}\""
-
-            # Añadir datos clave del output
+                summary += f': "{notes[:200]}"'
             if "recommendation" in output:
-                summary += f" [recomendación: {output['recommendation']}]"
+                summary += f" [recommendation: {output['recommendation']}]"
             if "document_status" in output:
                 summary += f" [docs: {output['document_status']}]"
             if "risk_category" in output:
-                summary += f" [riesgo: {output['risk_category']}]"
-            if "debt_to_income_ratio" in output:
-                summary += f" [ratio verificado: {output['debt_to_income_ratio']:.2f}]"
+                summary += f" [risk: {output['risk_category']}]"
+            if "credit_score_acceptable" in output:
+                summary += f" [score acceptable: {output['credit_score_acceptable']}]"
 
             lines.append(summary)
 
-        return "\n".join(lines) if lines else "Ninguna acción previa."
+        return "\n".join(lines) if lines else "No prior actions."
+
+    # ── Information-asymmetric context ────────
 
     def _build_case_context(self, state: ProcessState) -> str:
-        """Construye el contexto completo del caso para el LLM."""
-        case = state["case"]
-        ratio = case["monthly_cost"] / case["monthly_income"]
-        handoff = self._build_handoff_context(state)
+        """
+        Build context with INFORMATION ASYMMETRY.
+        Each agent sees only what they would see in real life.
+        """
+        app = state["application"]
 
-        return (
-            f"══ CASO ACTIVO ══\n"
-            f"ID: {case['case_id']}\n"
-            f"Monto solicitado: EUR {case['amount_requested']:,.0f}\n"
-            f"Propósito: {case['loan_goal']}\n"
-            f"Plazo: {case['number_of_terms']} meses | Cuota mensual: EUR {case['monthly_cost']:,.0f}\n"
-            f"Score crediticio: {case['credit_score']}\n"
-            f"Ingreso mensual declarado: EUR {case['monthly_income']:,.0f}\n"
-            f"Ratio deuda/ingreso estimado: {ratio:.2f}\n"
-            f"Estado actual: {state['status']}\n"
-            f"Revisiones previas del caso: {state['revision_count']}\n\n"
-            f"══ HISTORIAL DE ACCIONES ══\n"
-            f"{handoff}\n\n"
-            f"══ INSTRUCCIÓN ══\n"
-            f"Elige y ejecuta la tool más apropiada para tu siguiente paso."
+        # Application data — everyone sees this
+        context = (
+            f"== ACTIVE CASE ==\n"
+            f"ID: {app['case_id']}\n"
+            f"Requested amount: EUR {app['amount_requested']:,.0f}\n"
+            f"Loan goal: {app['loan_goal']}\n"
+            f"Application type: {app['application_type']}\n"
         )
+
+        # Credit bureau data — only visible after CheckCreditScore
+        if state.get("credit_checked") and state.get("credit_bureau_data"):
+            cbd = state["credit_bureau_data"]
+            context += (
+                f"\n== CREDIT BUREAU DATA (checked) ==\n"
+                f"Credit score: {cbd.get('credit_score', 'N/A')}\n"
+                f"Monthly cost: EUR {cbd.get('monthly_cost', 'N/A')}\n"
+                f"Number of terms: {cbd.get('number_of_terms', 'N/A')}\n"
+                f"Offered amount: EUR {cbd.get('offered_amount', 'N/A')}\n"
+            )
+        elif self.name != "junior_clerk" and not state.get("credit_checked"):
+            context += (
+                f"\n== CREDIT BUREAU DATA ==\n"
+                f"NOT YET CHECKED — call CheckCreditScore first.\n"
+            )
+
+        # Process state
+        context += (
+            f"\nStatus: {state['status']}\n"
+            f"Rework count: {state['rework_count']}\n"
+        )
+
+        # Handoff narrative
+        handoff = self._build_handoff_context(state)
+        context += (
+            f"\n== ACTION HISTORY ==\n"
+            f"{handoff}\n\n"
+            f"== INSTRUCTION ==\n"
+            f"Choose and execute the most appropriate tool for your next step."
+        )
+
+        return context
+
+    # ── Main execution ────────────────────────
 
     def __call__(self, state: ProcessState) -> dict:
         _log = logging.getLogger(f"bps.{self.name}")
-        case_id = state["case"]["case_id"]
+        case_id = state["application"]["case_id"]
 
-        user_content = self._build_case_context(state)
         messages = [
             SystemMessage(content=self.system_prompt),
-            {"role": "user", "content": user_content},
+            {"role": "user", "content": self._build_case_context(state)},
         ]
 
-        _log.debug(
-            "%s | ── PROMPT ──────────────────────────────\n"
-            "SYSTEM:\n%s\n\nUSER:\n%s",
-            case_id, self.system_prompt, user_content,
-        )
-
         response: AIMessage = self._bind_available_tools(state).invoke(messages)
-
-        usage = getattr(response, "usage_metadata", None) or (
-            response.response_metadata.get("token_usage") if response.response_metadata else None
-        )
-        _log.debug(
-            "%s | ── LLM RESPONSE ────────────────────────\n"
-            "content: %s\ntool_calls: %s\nusage: %s",
-            case_id,
-            response.content or "(empty)",
-            response.tool_calls,
-            usage,
-        )
 
         if not response.tool_calls:
             _log.warning("%s | no tool call — retrying", case_id)
@@ -168,9 +166,6 @@ class BaseAgent:
         tool_name = tool_call["name"]
         tool_args = tool_call["args"]
 
-        _log.debug("%s | ── TOOL INPUT ──────────────────────────\n%s(%s)", case_id, tool_name, tool_args)
-
-        # Validar con Pydantic — el único control hard que mantenemos
         schema_cls = self._all_tools.get(tool_name)
         tool_output = {}
         if schema_cls:
@@ -180,10 +175,7 @@ class BaseAgent:
                 tool_output = {"error": str(e)}
                 _log.error("%s | validation error in %s: %s", case_id, tool_name, e)
         else:
-            _log.warning("%s | unknown tool %s", case_id, tool_name)
             tool_output = tool_args
-
-        _log.debug("%s | ── TOOL OUTPUT ─────────────────────────\n%s", case_id, tool_output)
 
         action: AgentAction = {
             "agent_name":    self.name,
@@ -202,12 +194,9 @@ class BaseAgent:
         next_agent = self._resolve_next_agent(tool_name, tool_args, state)
         status = self._resolve_status(tool_name, tool_args)
 
-        _log.info(
-            "%s | %s | next=%s | status=%s",
-            case_id, tool_name, next_agent or "self", status,
-        )
+        _log.info("%s | %s | next=%s | status=%s", case_id, tool_name, next_agent or "self", status)
 
-        return {
+        result = {
             "messages":      [response, tool_message],
             "agent_history": [action],
             "current_agent": self.name,
@@ -215,8 +204,14 @@ class BaseAgent:
             "status":        status,
         }
 
-    def _resolve_next_agent(self, tool_name: str, tool_args: dict, state: ProcessState) -> str | None:
+        # CheckCreditScore reveals the credit bureau data
+        if tool_name == "CheckCreditScore":
+            result["credit_checked"] = True
+
+        return result
+
+    def _resolve_next_agent(self, tool_name, tool_args, state) -> str | None:
         return None
 
-    def _resolve_status(self, tool_name: str, tool_args: dict) -> str:
+    def _resolve_status(self, tool_name, tool_args) -> str:
         return "in_review"

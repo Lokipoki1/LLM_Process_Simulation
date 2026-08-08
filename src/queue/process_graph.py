@@ -68,7 +68,7 @@ def route(state: ProcessState) -> str:
 
 def increment_rework(state: ProcessState) -> dict:
     """Rework counter — incremented when SC sends case back to JC."""
-    return {"revision_count": state["revision_count"] + 1}
+    return {"rework_count": state["rework_count"] + 1}
 
 
 # ─────────────────────────────────────────────
@@ -198,7 +198,7 @@ class ProcessStepExecutor:
         if (partial_update.get("next_agent") == "junior_clerk"
                 and partial_update.get("current_agent") != "junior_clerk"):
             state = _merge_state(state, {
-                "revision_count": state["revision_count"] + 1
+                "rework_count": state["rework_count"] + 1
             })
 
         return state, next_role
@@ -236,9 +236,17 @@ def _resolve_next_role(state: ProcessState) -> str | None:
 # Initial state factory
 # ─────────────────────────────────────────────
 
-def make_initial_state(case: dict) -> ProcessState:
+def make_initial_state(application: dict, credit_data: dict | None = None) -> ProcessState:
+    """
+    Create initial state for a case.
+    application: LoanApplication fields (case_id, amount_requested, loan_goal, application_type)
+    credit_data: CreditBureauData fields (hidden until SC checks) — can be None for early rejections
+    """
     return ProcessState(
-        case=case, status="pending", current_agent="junior_clerk",
+        application=application,
+        credit_bureau_data=credit_data,
+        credit_checked=False,
+        status="pending", current_agent="junior_clerk",
         messages=[], agent_history=[], sim_clock=0.0, event_log=[],
-        revision_count=0, rejection_reason=None, next_agent=None,
+        rework_count=0, rejection_reason=None, next_agent=None,
     )
