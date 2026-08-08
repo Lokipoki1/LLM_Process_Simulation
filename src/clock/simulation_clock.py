@@ -1,41 +1,42 @@
 """
 simulation_clock.py
 --------------------
-Reloj lógico de simulación.
+Logical simulation clock.
 
-Responsabilidad única: dado el nombre de una actividad, devuelve
-una duración en segundos samplea de la distribución log-normal
-estimada a partir del BPIC 2012/2017.
+Single responsibility: given an activity name, return a duration in
+seconds sampled from a log-normal distribution estimated from the BPIC.
 
-Esto es CRÍTICO para que las métricas AED y CTD sean válidas:
-el LLM decide QUÉ actividad ejecutar, el reloj decide CUÁNTO tarda.
+This is CRITICAL for AED and CTD to be valid:
+the LLM decides WHAT activity to execute, the clock decides HOW LONG it takes.
+
+NOTE: this class only SAMPLES durations. The DES engine owns the
+simulation timeline — it is the only component that decides when an
+activity starts and finishes. `advance()` / `advance_for_activity()`
+are kept for the LangGraph observer path only.
 """
 
 from __future__ import annotations
 import numpy as np
-from scipy import stats
 
 
 # ─────────────────────────────────────────────────────────────────
-# Parámetros log-normal por actividad
-# Fuente: distribuciones aproximadas del BPIC 2012 (en segundos).
-# Estos valores se refinarán en la fase de dataset analysis (días 15-28)
-# usando extract_bpic_distributions() más abajo.
-#
-# Formato: { activity_name: (mu, sigma) } de la distribución log-normal
-# donde mu y sigma son los parámetros de la distribución subyacente normal.
+# Log-normal parameters per activity, keyed by TOOL CLASS NAME.
+# Format: { tool_name: (mu, sigma) } of the underlying normal
+# distribution. Replace with extract_bpic_distributions() output
+# once the BPIC calibration phase is done.
 # ─────────────────────────────────────────────────────────────────
 
 DEFAULT_DISTRIBUTIONS: dict[str, tuple[float, float]] = {
-    # Junior Clerk — keyed by tool class name (PascalCase)
+    # Junior Clerk
     "IntakeApplication":      (7.5, 0.8),   # ~1800s ≈ 30 min
     "CheckDocuments":         (7.8, 0.7),   # ~2400s ≈ 40 min
     "ForwardCase":            (6.2, 0.5),   # ~490s  ≈ 8 min
     "ReturnApplicationEarly": (6.0, 0.4),   # ~400s  ≈ 7 min
 
     # Senior Clerk
+    "CheckCreditScore":       (8.0, 0.7),   # ~3000s ≈ 50 min (bureau query + wait)
     "ValidateApplication":    (8.5, 0.9),   # ~4900s ≈ 80 min
-    "RequestAdditionalInfo":  (9.2, 1.0),   # ~9900s ≈ 165 min (espera respuesta)
+    "RequestAdditionalInfo":  (9.2, 1.0),   # ~9900s ≈ 165 min (waiting for a reply)
     "EscalateCase":           (6.5, 0.5),   # ~665s  ≈ 11 min
 
     # Credit Officer
@@ -43,25 +44,27 @@ DEFAULT_DISTRIBUTIONS: dict[str, tuple[float, float]] = {
     "ApproveLoan":            (7.2, 0.6),   # ~1300s ≈ 22 min
     "RejectLoan":             (7.0, 0.6),   # ~1100s ≈ 18 min
 
-    # Fallback para actividades no reconocidas
+    # Fallback for unrecognised activities
     "_default":               (7.5, 1.0),
 }
 
 
 class SimulationClock:
     """
-    Gestiona el tiempo lógico de la simulación.
+    Samples activity durations and (optionally) tracks a logical time cursor.
 
-    Uso:
-        clock = SimulationClock(start_timestamp="2012-01-01T08:00:00")
-        duration = clock.sample_duration("validate_application")
-        clock.advance(duration)
-        iso_ts = clock.current_iso()
+    In the DES engine only `sample_duration()` is used — the engine owns
+    the timeline. `advance()` and `advance_for_activity()` exist for the
+    LangGraph observer path (documentation artifact).
+
+    Usage:
+        clock = SimulationClock(start_timestamp="2017-01-02T08:00:00", seed=42)
+        seconds = clock.sample_duration("ValidateApplication")
     """
 
     def __init__(
         self,
-        start_timestamp: str = "2012-01-01T08:00:00",
+        start_timestamp: str = "2017-01-02T08:00:00",
         distributions: dict[str, tuple[float, float]] | None = None,
         seed: int | None = None,
     ):
@@ -70,46 +73,47 @@ class SimulationClock:
         self._distributions = distributions or DEFAULT_DISTRIBUTIONS
         self._rng = np.random.default_rng(seed)
 
-    # ── Tiempo actual ────────────────────────
+    # ── Current time ─────────────────────────
 
     @property
     def current(self) -> float:
-        """Tiempo lógico actual como Unix timestamp (float)."""
+        """Current logical time as a Unix timestamp (float)."""
         return self._current
 
     def current_iso(self) -> str:
-        """Tiempo lógico actual como string ISO 8601."""
+        """Current logical time as an ISO 8601 string."""
         from datetime import datetime, timezone
         return datetime.fromtimestamp(self._current, tz=timezone.utc).isoformat()
 
-    # ── Sampling y avance ────────────────────
+    # ── Sampling ─────────────────────────────
 
     def sample_duration(self, activity_name: str) -> float:
         """
-        Samplea una duración en segundos para la actividad dada.
-        Usa la distribución log-normal configurada para esa actividad.
-        Si la actividad no está en el diccionario, usa '_default'.
+        Sample a duration in seconds for the given activity.
+        Falls back to '_default' if the activity is not configured.
         """
         mu, sigma = self._distributions.get(
             activity_name,
-            self._distributions["_default"]
+            self._distributions["_default"],
         )
         duration = float(self._rng.lognormal(mean=mu, sigma=sigma))
-        # Cap máximo de 7 días para evitar outliers extremos
+        # Cap at 7 days to avoid extreme outliers
         return min(duration, 7 * 24 * 3600)
 
+    # ── Time cursor (LangGraph observer path only) ──
+
     def advance(self, seconds: float) -> float:
-        """
-        Avanza el reloj en `seconds` segundos.
-        Devuelve el nuevo timestamp.
-        """
+        """Advance the cursor by `seconds`. Returns the new timestamp."""
         self._current += seconds
         return self._current
 
     def advance_for_activity(self, activity_name: str) -> tuple[float, float]:
         """
-        Samplea duración para la actividad y avanza el reloj.
-        Devuelve (duration_seconds, new_timestamp).
+        Sample a duration and advance the cursor.
+        Returns (duration_seconds, new_timestamp).
+
+        NOT used by the DES engine — the engine samples durations directly
+        and owns the timeline.
         """
         duration = self.sample_duration(activity_name)
         new_ts = self.advance(duration)
@@ -117,29 +121,33 @@ class SimulationClock:
 
 
 # ─────────────────────────────────────────────────────────────────
-# Utilidad: extrae distribuciones reales del BPIC
-# Se llama una vez durante la fase de dataset analysis (días 15-28)
-# y sobreescribe DEFAULT_DISTRIBUTIONS con valores reales.
+# Extract real distributions from a BPIC event log.
+# Run once during the dataset analysis phase, then pass the result
+# to SimulationClock(distributions=...).
 # ─────────────────────────────────────────────────────────────────
 
 def extract_bpic_distributions(xes_path: str) -> dict[str, tuple[float, float]]:
     """
-    Lee un event log XES del BPIC y estima parámetros log-normal
-    para cada actividad basándose en las duraciones reales.
+    Read a BPIC XES log and estimate log-normal parameters per activity
+    from the observed durations between consecutive events.
+
+    NOTE: the returned keys are BPIC ACTIVITY names (e.g. "A_Submitted"),
+    while SimulationClock is keyed by TOOL names (e.g. "IntakeApplication").
+    A mapping between the two vocabularies is required before these
+    distributions can be plugged into the clock.
 
     Args:
-        xes_path: ruta al archivo .xes del BPIC 2012 o 2017
+        xes_path: path to the BPIC .xes file
 
     Returns:
-        dict {activity_name: (mu, sigma)} listo para pasar a SimulationClock
+        dict {activity_name: (mu, sigma)}
     """
     import pm4py
-    import pandas as pd
 
     log = pm4py.read_xes(xes_path)
     df = pm4py.convert_to_dataframe(log)
 
-    # Calcular duración de cada evento (diferencia con el siguiente del mismo caso)
+    # Duration of each event = gap to the next event in the same case
     df = df.sort_values(["case:concept:name", "time:timestamp"])
     df["duration"] = (
         df.groupby("case:concept:name")["time:timestamp"]
@@ -155,11 +163,11 @@ def extract_bpic_distributions(xes_path: str) -> dict[str, tuple[float, float]]:
         durations = group["duration"].values
         if len(durations) < 5:
             continue
-        # Fit log-normal: np.log transforma a distribución normal
         log_durations = np.log(durations)
-        mu = float(np.mean(log_durations))
-        sigma = float(np.std(log_durations))
-        distributions[str(activity)] = (mu, sigma)
+        distributions[str(activity)] = (
+            float(np.mean(log_durations)),
+            float(np.std(log_durations)),
+        )
 
     distributions["_default"] = DEFAULT_DISTRIBUTIONS["_default"]
     return distributions

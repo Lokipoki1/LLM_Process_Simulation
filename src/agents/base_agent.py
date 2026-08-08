@@ -1,7 +1,7 @@
 """
-base_agent.py — v5 (information asymmetry)
-──────────────────────────────────────────
-Context builder enforces information asymmetry:
+base_agent.py — information asymmetry
+─────────────────────────────────────
+The context builder enforces information asymmetry:
   - JC: sees application data only
   - SC: sees application + credit bureau data (after CheckCreditScore)
   - CO: sees everything + all prior reasoning
@@ -54,11 +54,11 @@ class BaseAgent:
     # ── Handoff narrative ─────────────────────
 
     def _build_handoff_context(self, state: ProcessState) -> str:
-        """Build narrative summary of all prior agent actions."""
+        """Narrative summary of every prior agent action, in their own words."""
         lines = []
         for action in state["agent_history"]:
-            agent  = action["agent_name"].replace("_", " ").title()
-            tool   = action["tool_name"]
+            agent = action["agent_name"].replace("_", " ").title()
+            tool = action["tool_name"]
             output = action["tool_output"]
 
             notes = (
@@ -94,12 +94,12 @@ class BaseAgent:
 
     def _build_case_context(self, state: ProcessState) -> str:
         """
-        Build context with INFORMATION ASYMMETRY.
+        Build the case context with INFORMATION ASYMMETRY.
         Each agent sees only what they would see in real life.
         """
         app = state["application"]
 
-        # Application data — everyone sees this
+        # Application data — every role sees this
         context = (
             f"== ACTIVE CASE ==\n"
             f"ID: {app['case_id']}\n"
@@ -108,7 +108,7 @@ class BaseAgent:
             f"Application type: {app['application_type']}\n"
         )
 
-        # Credit bureau data — only visible after CheckCreditScore
+        # Credit bureau data — only after CheckCreditScore
         if state.get("credit_checked") and state.get("credit_bureau_data"):
             cbd = state["credit_bureau_data"]
             context += (
@@ -118,7 +118,9 @@ class BaseAgent:
                 f"Number of terms: {cbd.get('number_of_terms', 'N/A')}\n"
                 f"Offered amount: EUR {cbd.get('offered_amount', 'N/A')}\n"
             )
-        elif self.name != "junior_clerk" and not state.get("credit_checked"):
+        elif self.name == "senior_clerk" and not state.get("credit_checked"):
+            # Only the SC owns CheckCreditScore — never prompt other roles
+            # to call a tool they do not have.
             context += (
                 f"\n== CREDIT BUREAU DATA ==\n"
                 f"NOT YET CHECKED — call CheckCreditScore first.\n"
@@ -131,10 +133,9 @@ class BaseAgent:
         )
 
         # Handoff narrative
-        handoff = self._build_handoff_context(state)
         context += (
             f"\n== ACTION HISTORY ==\n"
-            f"{handoff}\n\n"
+            f"{self._build_handoff_context(state)}\n\n"
             f"== INSTRUCTION ==\n"
             f"Choose and execute the most appropriate tool for your next step."
         )
@@ -167,7 +168,6 @@ class BaseAgent:
         tool_args = tool_call["args"]
 
         schema_cls = self._all_tools.get(tool_name)
-        tool_output = {}
         if schema_cls:
             try:
                 tool_output = schema_cls(**tool_args).model_dump()
@@ -182,8 +182,8 @@ class BaseAgent:
             "tool_name":     tool_name,
             "tool_input":    tool_args,
             "tool_output":   tool_output,
-            "sim_timestamp": state["sim_clock"],
-            "real_duration": 0.0,
+            "sim_timestamp": state["sim_clock"],   # engine overwrites with DES time
+            "real_duration": 0.0,                  # engine overwrites with DES duration
         }
 
         tool_message = ToolMessage(
@@ -194,7 +194,10 @@ class BaseAgent:
         next_agent = self._resolve_next_agent(tool_name, tool_args, state)
         status = self._resolve_status(tool_name, tool_args)
 
-        _log.info("%s | %s | next=%s | status=%s", case_id, tool_name, next_agent or "self", status)
+        _log.info(
+            "%s | %s | next=%s | status=%s",
+            case_id, tool_name, next_agent or "self", status,
+        )
 
         result = {
             "messages":      [response, tool_message],
@@ -204,7 +207,7 @@ class BaseAgent:
             "status":        status,
         }
 
-        # CheckCreditScore reveals the credit bureau data
+        # CheckCreditScore reveals the credit bureau data from here on
         if tool_name == "CheckCreditScore":
             result["credit_checked"] = True
 
