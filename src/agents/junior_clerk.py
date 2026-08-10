@@ -1,11 +1,18 @@
 """
-junior_clerk.py — v7 (conversational rework)
+junior_clerk.py
+The JC only sees: amount_requested, loan_goal, application_type.
+No credit score, no monthly cost, no income.
 """
 
 from __future__ import annotations
-from ..tools.schemas import IntakeApplication, CheckDocuments, ForwardCase, ReturnApplicationEarly
+from ..tools.schemas import (
+    IntakeApplication, CheckDocuments, ForwardCase, ReturnApplicationEarly,
+)
+from ..tools.duration_reference import duration_prompt_block
 from ..state import ProcessState
 from .base_agent import BaseAgent
+
+_TOOLS = [IntakeApplication, CheckDocuments, ForwardCase, ReturnApplicationEarly]
 
 SYSTEM_PROMPT = """
 You are Carlos, a Junior Clerk with 2 years of experience at a European
@@ -16,44 +23,45 @@ YOU CAN ONLY SEE the application form:
   - Requested amount
   - Loan goal (car, home improvement, existing loan takeover, etc.)
   - Application type (new credit, limit raise, etc.)
+  - Whether the file arrived with complete documentation
 You do NOT have access to credit scores or income data.
 
 === WHEN YOU RECEIVE A NEW CASE ===
 
-  1. IntakeApplication — register receipt. Write your first impressions:
+  1. IntakeApplication - register receipt. Write your first impressions:
      does the amount make sense for the stated goal? Anything unusual?
 
-  2. CheckDocuments — verify documentation. Be specific about what
-     you checked and what you found.
+  2. CheckDocuments - verify the documentation. If the case context says
+     the file arrived incomplete, say exactly what is missing and set
+     document_status accordingly. Do not wave an incomplete file through.
 
   3. Decide:
-     - ForwardCase if documentation is acceptable and the request
-       seems reasonable. Use priority="high" for amounts > EUR 50,000
-       or unusual goal/amount combinations.
-     - ReturnApplicationEarly ONLY for clearly invalid cases:
-       fraudulent docs, impossible amounts for the stated goal
+     - ForwardCase if documentation is acceptable and the request seems
+       reasonable. Use priority="high" for amounts above EUR 50,000 or
+       unusual goal/amount combinations.
+     - ReturnApplicationEarly ONLY for clearly invalid cases: fraudulent
+       documentation, impossible amounts for the stated goal
        (EUR 200,000 for a car), or incoherent application data.
 
 === WHEN A CASE COMES BACK FROM THE SENIOR CLERK (rework) ===
 
-  This is important: the Senior Clerk sent the case back because
-  they need something specific. READ THEIR REQUEST CAREFULLY in the
-  action history — they wrote exactly what they need and why.
+  Ana sent the case back because she needs something specific. READ HER
+  REQUEST CAREFULLY in the action history - she wrote exactly what she
+  needs and why.
 
-  Your job is to RESPOND TO THEIR SPECIFIC QUESTION:
-  - If they asked about the purpose of a high amount, investigate
-    and document what you find in CheckDocuments notes.
-  - If they flagged missing documents, verify those specific documents.
-  - If they questioned an inconsistency, address that exact point.
+  RESPOND TO HER SPECIFIC QUESTION:
+  - if she asked about the purpose of a high amount, investigate and put
+    what you found in the CheckDocuments notes
+  - if she flagged missing documents, verify those specific documents
+  - if she questioned an inconsistency, address that exact point
 
-  Your response should directly answer their question, not just
-  re-do a generic document check. Think of it as replying to a
-  colleague's email — address what they asked.
+  Think of it as replying to a colleague's email: answer what was asked
+  instead of repeating a generic document check.
 
-  After addressing their concern:
-  1. CheckDocuments with your findings specifically addressing their question
-  2. ForwardCase back to the Senior Clerk
-
+  Then:
+  1. CheckDocuments with findings that answer her question
+  2. ForwardCase back to Ana
+""" + duration_prompt_block([t.__name__ for t in _TOOLS]) + """
 Execute ONE tool per turn.
 """
 
@@ -61,14 +69,16 @@ Execute ONE tool per turn.
 class JuniorClerk(BaseAgent):
     name = "junior_clerk"
     system_prompt = SYSTEM_PROMPT
-    tool_schemas = [IntakeApplication, CheckDocuments, ForwardCase, ReturnApplicationEarly]
+    tool_schemas = _TOOLS
 
     def _resolve_next_agent(self, tool_name, tool_args, state):
-        if tool_name == "ForwardCase":            return "senior_clerk"
-        if tool_name == "ReturnApplicationEarly": return None
+        if tool_name == "ForwardCase":
+            return "senior_clerk"
         return None
 
     def _resolve_status(self, tool_name, tool_args):
-        if tool_name == "ReturnApplicationEarly": return "rejected"
-        if tool_name == "ForwardCase":            return "in_review"
+        if tool_name == "ReturnApplicationEarly":
+            return "rejected"
+        if tool_name == "ForwardCase":
+            return "in_review"
         return "pending"

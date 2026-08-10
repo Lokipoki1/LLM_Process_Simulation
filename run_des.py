@@ -4,17 +4,20 @@ run_des.py
 Run the Discrete Event Simulation engine.
 
 Usage:
-    # Synthetic cases, default config:
+    # Synthetic cases:
     python run_des.py --cases 20
 
-    # With BPIC data:
-    python run_des.py --cases 100 --bpic data/bpic/BPI_Challenge_2012.xes
+    # Real BPIC 2017 cases:
+    python run_des.py --cases 100 --bpic data/bpic/BPI_Challenge_2017.xes
 
-    # Custom workforce:
-    python run_des.py --cases 50 --jc 3 --sc 2 --co 1
+    # Agents estimate their own durations (default):
+    python run_des.py --cases 20 --durations llm
 
-    # With verbose logging:
-    python run_des.py --cases 20 --verbose
+    # Baseline: durations sampled from BPIC-fitted distributions
+    python run_des.py --cases 20 --durations distribution
+
+    # Custom workforce and arrival rate:
+    python run_des.py --cases 50 --jc 3 --sc 2 --co 1 --arrival 30
 """
 
 import argparse
@@ -23,7 +26,6 @@ import numpy as np
 from dotenv import load_dotenv
 
 from src.queue.simulation_engine import SimulationEngine, EngineConfig
-from src.queue.agent_pool import WorkSchedule
 from src.clock.simulation_clock import SimulationClock
 from src.simulation_controller import generate_synthetic_case, load_bpic_cases
 from src.logger import setup_logging
@@ -32,7 +34,7 @@ load_dotenv()
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Multi-LLM-Agent BPS — DES Engine")
+    p = argparse.ArgumentParser(description="Multi-LLM-Agent BPS - DES Engine")
     p.add_argument("--cases",     type=int,   default=20,     help="Number of cases to simulate")
     p.add_argument("--bpic",      type=str,   default=None,   help="Path to BPIC XES file")
     p.add_argument("--model",     type=str,   default=None,   help="LLM model name")
@@ -42,6 +44,10 @@ def parse_args():
     p.add_argument("--sc",        type=int,   default=1,      help="Number of Senior Clerks")
     p.add_argument("--co",        type=int,   default=1,      help="Number of Credit Officers")
     p.add_argument("--arrival",   type=float, default=60.0,   help="Mean inter-arrival time (minutes)")
+    p.add_argument(
+        "--durations", type=str, default="llm", choices=["llm", "distribution"],
+        help="Where activity durations come from (default: llm)",
+    )
     p.add_argument("--verbose",   action="store_true",        help="Print debug logs to console")
     return p.parse_args()
 
@@ -59,23 +65,24 @@ def main():
         print(f"  Loaded {len(cases)} cases from BPIC")
     else:
         rng = np.random.default_rng(args.seed)
-        cases = [generate_synthetic_case(f"LOAN-{i:04d}", rng) for i in range(1, args.cases + 1)]
+        cases = [
+            generate_synthetic_case(f"LOAN-{i:04d}", rng)
+            for i in range(1, args.cases + 1)
+        ]
         print(f"  Generated {len(cases)} synthetic cases (seed={args.seed})")
 
-    # Build engine config
     config = EngineConfig(
         n_junior_clerks=args.jc,
         n_senior_clerks=args.sc,
         n_credit_officers=args.co,
-        mean_interarrival_s=args.arrival * 60,  # convert minutes to seconds
+        mean_interarrival_s=args.arrival * 60,
+        duration_source=args.durations,
         model=model,
         ollama_base_url=base_url,
     )
 
-    # Build clock
-    clock = SimulationClock(start_timestamp="2012-01-02T08:00:00", seed=args.seed)
+    clock = SimulationClock(start_timestamp="2017-01-02T08:00:00", seed=args.seed)
 
-    # Build and run engine
     engine = SimulationEngine(
         cases=cases,
         config=config,
@@ -83,24 +90,36 @@ def main():
         output_dir=args.output,
     )
 
-    results = engine.run(seed=args.seed)
+    engine.run(seed=args.seed)
 
     # Export
     engine.export_json("simulation.json")
     if engine._global_event_log:
         engine.export_xes("simulation.xes")
 
-    # Summary table
+    # Case summary
     df = engine.summary_dataframe()
     if not df.empty:
         print("\n  Case summary:")
         print(df.to_string(index=False))
 
-        approved_pct = (df["status"] == "approved").mean() * 100
-        print(f"\n  Approval rate: {approved_pct:.1f}%")
+        print(f"\n  Approval rate: {(df['status'] == 'approved').mean() * 100:.1f}%")
         print(f"  Avg steps/case: {df['n_steps'].mean():.1f}")
         print(f"  Avg cycle time: {df['cycle_time_h'].mean():.1f}h")
-        print(f"  Avg queue time: {df['queue_time_h'].mean():.1f}h\n")
+        print(f"  Avg work time:  {df['work_time_h'].mean():.1f}h")
+        print(f"  Avg queue time: {df['queue_time_h'].mean():.1f}h")
+
+    # Duration estimates by tool (only meaningful with --durations llm)
+    dur = engine.duration_summary()
+    if not dur.empty:
+        print("\n  Agent duration estimates (minutes):")
+        print(dur.to_string(index=False))
+        engine.duration_dataframe().to_csv(
+            f"{args.output}/durations.csv", index=False,
+        )
+        print(f"\n  Raw estimates -> {args.output}/durations.csv")
+
+    print()
 
 
 if __name__ == "__main__":

@@ -5,19 +5,29 @@ Discrete Event Simulation (DES) engine for multi-LLM-agent BPS.
 
 Event-based simulator where:
   - multiple cases run concurrently
-  - agents have working hours (busyness clock)
-  - cases wait in queues when agents are busy
+  - each role has one shared FIFO queue feeding several workers
+  - workers have working hours (busyness clock)
   - time advances by jumping between events, not step by step
 
 CLOCK OWNERSHIP
-  The engine is the single source of truth for simulation time.
-  For each step it samples the activity duration exactly once, schedules
-  the completion event at `dispatch_time + duration`, and stamps the XES
-  entry with that completion time. The ProcessStepExecutor performs the
-  LLM call only — it never advances a clock and never emits XES entries.
+    The engine is the single owner of the simulation timeline. For each
+    step it determines the hands-on work time exactly once, spreads that
+    work across the worker's shift windows, schedules the completion
+    event, and stamps the XES entry with the completion time.
 
-  This matters: XES timestamps are what AED and CTD are computed from,
-  so they must reflect the engine's queues and parallel workers.
+DURATION SOURCE
+    config.duration_source selects where the work time comes from:
+
+      "llm"           the agent's own duration_minutes estimate on the
+                      tool call. Time estimation becomes part of the
+                      agent's cognition.
+      "distribution"  a sample from the BPIC-fitted log-normal in
+                      SimulationClock. This is the AgentSimulator-style
+                      baseline.
+
+    Both run on identical cases, so the two can be compared directly.
+    Under "llm", a missing or invalid estimate falls back to the
+    distribution and is counted in `duration_fallbacks`.
 """
 
 from __future__ import annotations
@@ -35,7 +45,7 @@ from .agent_pool import (
     AgentPool, AgentWorker, WorkSchedule,
     compute_next_shift_start, compute_finish_time,
 )
-from .process_graph import ProcessStepExecutor
+from .step_executor import StepExecutor, merge_state
 from ..observer.observer import build_xes_entry
 from ..clock.simulation_clock import SimulationClock
 from ..state import ProcessState
@@ -43,46 +53,10 @@ from ..state import ProcessState
 logger = logging.getLogger("bps.engine")
 
 
-# ─────────────────────────────────────────────
-# State merge (replicates LangGraph's operator.add)
-# ─────────────────────────────────────────────
+# -------------------------------------------------
+# Process flow constraints
+# -------------------------------------------------
 
-_APPEND_FIELDS = {"messages", "agent_history", "event_log"}
-
-
-def merge_state(current: ProcessState, partial: dict) -> ProcessState:
-    """Merge a partial update into the state; append-only fields are extended."""
-    merged = dict(current)
-    for key, value in partial.items():
-        if key in _APPEND_FIELDS and isinstance(value, list):
-            merged[key] = list(merged.get(key, [])) + value
-        else:
-            merged[key] = value
-    return ProcessState(**merged)
-
-
-# ─────────────────────────────────────────────
-# Routing
-# ─────────────────────────────────────────────
-
-def resolve_next_role(state: ProcessState) -> str | None:
-    """Which role handles the next step, or None if the case is complete."""
-    if state["status"] in ("approved", "rejected"):
-        return None
-
-    next_agent = state.get("next_agent")
-    if next_agent in ("junior_clerk", "senior_clerk", "credit_officer"):
-        return next_agent
-
-    current = state.get("current_agent")
-    if current in ("junior_clerk", "senior_clerk", "credit_officer"):
-        return current
-
-    return None
-
-
-# Valid transitions — enforces the process flow.
-# A case can only move to a role if there is a valid path to it.
 VALID_TRANSITIONS: dict[str, set[str]] = {
     "junior_clerk":   {"junior_clerk", "senior_clerk"},
     "senior_clerk":   {"senior_clerk", "credit_officer", "junior_clerk"},
@@ -91,7 +65,7 @@ VALID_TRANSITIONS: dict[str, set[str]] = {
 
 
 def validate_transition(current_role: str, next_role: str, case_id: str) -> bool:
-    """Check a case transition against the process flow; logs if invalid."""
+    """Check a transition against the process flow; logs if invalid."""
     valid = VALID_TRANSITIONS.get(current_role, set())
     if next_role not in valid:
         logger.error(
@@ -102,9 +76,9 @@ def validate_transition(current_role: str, next_role: str, case_id: str) -> bool
     return True
 
 
-# ─────────────────────────────────────────────
+# -------------------------------------------------
 # Configuration
-# ─────────────────────────────────────────────
+# -------------------------------------------------
 
 @dataclass
 class EngineConfig:
@@ -120,7 +94,10 @@ class EngineConfig:
     co_schedule: WorkSchedule = field(default_factory=lambda: WorkSchedule(9.0, 17.0))
 
     # Case arrivals
-    mean_interarrival_s: float = 3600.0   # mean seconds between arrivals
+    mean_interarrival_s: float = 3600.0
+
+    # Where activity durations come from: "llm" or "distribution"
+    duration_source: str = "llm"
 
     # Safety limits
     max_steps_per_case: int = 20
@@ -132,9 +109,9 @@ class EngineConfig:
     temperature: float = 0.3
 
 
-# ─────────────────────────────────────────────
+# -------------------------------------------------
 # Case result
-# ─────────────────────────────────────────────
+# -------------------------------------------------
 
 @dataclass
 class CaseResult:
@@ -143,22 +120,22 @@ class CaseResult:
     rework_count: int
     n_steps: int
     n_log_entries: int
-    wall_time_s: float      # real elapsed LLM time for this case
+    wall_time_s: float      # real LLM time spent on this case
     sim_start: float        # sim time the case arrived
     sim_end: float          # sim time the case completed
     queue_time_s: float     # total time waiting in queues
+    work_time_s: float      # total hands-on work time
     event_log: list = field(default_factory=list)
 
 
-# ─────────────────────────────────────────────
+# -------------------------------------------------
 # Engine
-# ─────────────────────────────────────────────
+# -------------------------------------------------
 
 class SimulationEngine:
     """
     Discrete event simulation engine for multi-LLM-agent BPS.
 
-    Usage:
         engine = SimulationEngine(cases, config, clock)
         results = engine.run()
         engine.export_xes("simulation.xes")
@@ -176,28 +153,31 @@ class SimulationEngine:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
 
-        # Simulation state
         self._event_queue = EventQueue()
         self._clock = clock or SimulationClock()
         self._agent_pool = AgentPool()
+
         self._case_states: dict[str, ProcessState] = {}
         self._case_arrivals: dict[str, float] = {}
         self._case_queue_time: dict[str, float] = {}
         self._case_queue_start: dict[str, float] = {}
         self._case_wall_time: dict[str, float] = {}
+        self._case_work_time: dict[str, float] = {}
         self._step_counts: dict[str, int] = {}
+
         self._results: list[CaseResult] = []
         self._global_event_log: list[dict] = []
         self._events_processed = 0
         self._scheduled_shifts: set[str] = set()
         self._last_printed = 0
+        self._duration_fallbacks = 0
+        self._duration_samples: list[tuple[str, float]] = []  # (tool, minutes)
 
         self._build_agent_pool()
 
-    # ── Setup ─────────────────────────────────────
+    # -- Setup ---------------------------------
 
     def _build_llm(self):
-        """Instantiate the LLM based on config."""
         model = self.config.model
         if model.startswith("gpt-"):
             from langchain_openai import ChatOpenAI
@@ -210,11 +190,7 @@ class SimulationEngine:
         )
 
     def _build_agent_pool(self):
-        """Create workers for each role plus the shared step executor."""
-        llm = self._build_llm()
-
-        # The executor holds the agents; workers are resources with queues.
-        self._executor = ProcessStepExecutor(llm)
+        self._executor = StepExecutor(self._build_llm())
 
         roles = [
             ("junior_clerk", self.config.n_junior_clerks, self.config.jc_schedule),
@@ -229,17 +205,16 @@ class SimulationEngine:
                     schedule=schedule,
                 ))
 
-    # ── Case arrivals ─────────────────────────────
+    # -- Case arrivals -------------------------
 
     def _schedule_arrivals(self, rng: np.random.Generator):
-        """Schedule all case arrivals as a Poisson process, snapped to office hours."""
+        """Schedule arrivals as a Poisson process, snapped to office hours."""
         office = WorkSchedule(8.0, 17.0)
         current_time = self._clock.current
 
         for case in self.cases:
             current_time += rng.exponential(self.config.mean_interarrival_s)
 
-            # Snap arrivals outside office hours to the next shift start
             dt = datetime.fromtimestamp(current_time, tz=timezone.utc)
             hour = dt.hour + dt.minute / 60.0
             if hour >= office.shift_end or hour < office.shift_start or dt.weekday() >= 5:
@@ -272,10 +247,35 @@ class SimulationEngine:
             rework_count=0, rejection_reason=None, next_agent=None,
         )
 
-    # ── Event handlers ────────────────────────────
+    # -- Duration resolution -------------------
+
+    def _resolve_work_seconds(self, tool_name: str | None, tool_output: dict) -> float:
+        """
+        Hands-on work time for one activity, per config.duration_source.
+
+        "llm"           the agent's duration_minutes estimate
+        "distribution"  a sample from the BPIC-fitted log-normal
+
+        An unusable LLM estimate falls back to the distribution and is
+        counted, so the fallback rate is reportable.
+        """
+        if self.config.duration_source == "llm":
+            minutes = tool_output.get("duration_minutes")
+            if isinstance(minutes, (int, float)) and minutes > 0:
+                self._duration_samples.append((tool_name or "unknown", float(minutes)))
+                return float(minutes) * 60.0
+            self._duration_fallbacks += 1
+            logger.warning(
+                "No usable duration_minutes for %s - falling back to distribution",
+                tool_name or "unknown",
+            )
+
+        return self._clock.sample_duration(tool_name or "_default")
+
+    # -- Event handlers ------------------------
 
     def _handle_arrival(self, event: SimEvent):
-        """A new case enters the system → enqueue it for a junior clerk."""
+        """A new case enters the system and joins the junior clerk queue."""
         case_id = event.case_id
 
         self._case_states[case_id] = self._make_initial_state(event.data)
@@ -283,6 +283,7 @@ class SimulationEngine:
         self._case_queue_time[case_id] = 0.0
         self._case_queue_start[case_id] = event.time
         self._case_wall_time[case_id] = 0.0
+        self._case_work_time[case_id] = 0.0
         self._step_counts[case_id] = 0
 
         self._agent_pool.enqueue_case("junior_clerk", case_id)
@@ -296,19 +297,17 @@ class SimulationEngine:
         self._try_dispatch_all(event.time)
 
     def _handle_step_complete(self, event: SimEvent):
-        """An agent finished a step → stamp the XES entry and route the case."""
+        """A worker finished a step: stamp the XES entry and route the case."""
         case_id = event.case_id
-        worker = self._agent_pool.get_worker(event.worker_id)
-        worker.current_case = None   # free the worker
+        self._agent_pool.release(event.worker_id)
 
         state = self._case_states[case_id]
         step_result = event.data
         next_role = step_result.get("next_role")
 
-        # ── Stamp the XES entry with DES time ──
-        # Only if this step actually produced a new action. Without this
-        # guard, a step where the LLM returned text instead of a tool call
-        # would re-log the previous action.
+        # Stamp the XES entry with DES time, only if this step produced
+        # a new action (a step where the LLM returned text instead of a
+        # tool call must not re-log the previous action).
         if step_result.get("produced_action") and state["agent_history"]:
             last_action = state["agent_history"][-1]
             dispatch_time = step_result.get("_dispatch_time", event.time)
@@ -324,7 +323,6 @@ class SimulationEngine:
             })
             self._case_states[case_id] = state
 
-        # ── Route the case ──
         if next_role is None:
             self._complete_case(case_id, event.time)
         else:
@@ -340,41 +338,38 @@ class SimulationEngine:
 
         self._try_dispatch_all(event.time)
 
-    # ── Dispatch ──────────────────────────────────
+    # -- Dispatch ------------------------------
 
     def _try_dispatch_all(self, sim_time: float):
-        """Dispatch work to every idle worker that has cases queued."""
+        """Hand queued work to every idle, on-shift worker."""
         while True:
-            worker = self._agent_pool.find_any_dispatchable(sim_time)
-            if not worker:
+            claim = self._agent_pool.claim_next(sim_time)
+            if claim is None:
                 break
-            self._dispatch_step(worker, sim_time)
+            worker, case_id = claim
+            self._dispatch_step(worker, case_id, sim_time)
 
-        # Wake up off-shift workers that have work waiting, otherwise
-        # their cases would be orphaned when everyone goes home.
-        for w in self._agent_pool.get_all_workers():
-            if w.queue and w.is_idle and not w.is_on_shift(sim_time):
-                next_start = w.next_shift_start(sim_time)
-                event_key = f"shift_{w.worker_id}_{next_start:.0f}"
-                if event_key not in self._scheduled_shifts:
-                    self._scheduled_shifts.add(event_key)
-                    self._event_queue.schedule_shift(
-                        time=next_start,
-                        worker_id=w.worker_id,
-                        event_type=EventType.SHIFT_START,
-                    )
-                    logger.debug(
-                        "%s off-shift with %d queued — shift start scheduled at %s",
-                        w.worker_id, len(w.queue),
-                        datetime.fromtimestamp(next_start, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                    )
+        # Wake up off-shift workers whose role has work waiting, otherwise
+        # those cases are orphaned when everyone goes home.
+        for w in self._agent_pool.workers_needing_shift_wakeup(sim_time):
+            next_start = w.next_shift_start(sim_time)
+            event_key = f"shift_{w.worker_id}_{next_start:.0f}"
+            if event_key in self._scheduled_shifts:
+                continue
+            self._scheduled_shifts.add(event_key)
+            self._event_queue.schedule_shift(
+                time=next_start,
+                worker_id=w.worker_id,
+                event_type=EventType.SHIFT_START,
+            )
+            logger.debug(
+                "%s off-shift with work waiting - shift start scheduled at %s",
+                w.worker_id,
+                datetime.fromtimestamp(next_start, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            )
 
-    def _dispatch_step(self, worker: AgentWorker, sim_time: float):
-        """Have a worker process one step of the next case in its queue."""
-        if not worker.queue:
-            return
-
-        case_id = worker.queue.popleft()
+    def _dispatch_step(self, worker: AgentWorker, case_id: str, sim_time: float):
+        """Run one step of `case_id` on `worker`. The case is already claimed."""
         state = self._case_states[case_id]
         self._step_counts[case_id] = self._step_counts.get(case_id, 0) + 1
 
@@ -385,18 +380,18 @@ class SimulationEngine:
 
         # Safety net
         if self._step_counts[case_id] > self.config.max_steps_per_case:
-            logger.warning("%s | MAX_STEPS reached — forcing completion", case_id)
+            logger.warning("%s | MAX_STEPS reached - forcing completion", case_id)
             self._case_states[case_id] = merge_state(state, {"status": "rejected"})
+            self._agent_pool.release(worker.worker_id)
             self._complete_case(case_id, sim_time)
             return
 
-        worker.current_case = case_id
         logger.debug(
             "%s | DISPATCH to %s (step %d)",
             case_id, worker.worker_id, self._step_counts[case_id],
         )
 
-        # ── LLM call (no clock side effects inside) ──
+        # LLM call - no clock side effects inside
         t0 = time.time()
         try:
             updated_state, next_role = self._executor.execute_step(state, worker.role)
@@ -407,25 +402,20 @@ class SimulationEngine:
         wall_time = time.time() - t0
         self._case_wall_time[case_id] = self._case_wall_time.get(case_id, 0.0) + wall_time
 
-        # Did this step actually produce a new action?
         produced_action = (
             len(updated_state["agent_history"]) > len(state["agent_history"])
         )
-        tool_name = (
-            updated_state["agent_history"][-1]["tool_name"]
-            if produced_action else None
-        )
+        last_action = updated_state["agent_history"][-1] if produced_action else None
+        tool_name = last_action["tool_name"] if last_action else None
+        tool_output = last_action["tool_output"] if last_action else {}
 
-        # ── Sample the activity WORK time ONCE ──
-        # This is actual working seconds, not elapsed wall time.
-        work_seconds = self._clock.sample_duration(tool_name or "_default")
+        # Hands-on work time, then spread across the worker's shifts
+        work_seconds = self._resolve_work_seconds(tool_name, tool_output)
+        self._case_work_time[case_id] = self._case_work_time.get(case_id, 0.0) + work_seconds
 
-        # Spread the work across the worker's shift windows. An activity
-        # that does not fit before the end of the day is suspended and
-        # resumed at the next shift start, so no event lands after hours.
         finish_time = compute_finish_time(sim_time, work_seconds, worker.schedule)
         elapsed = finish_time - sim_time
-        suspended = elapsed > work_seconds + 60   # crossed at least one shift boundary
+        suspended = elapsed > work_seconds + 60
 
         logger.info(
             "%s | %s on %s | tool=%s | work=%.0fmin | elapsed=%.0fmin%s | wall=%.1fs | next=%s",
@@ -448,10 +438,9 @@ class SimulationEngine:
             },
         )
 
-    # ── Completion ────────────────────────────────
+    # -- Completion ----------------------------
 
     def _complete_case(self, case_id: str, sim_time: float):
-        """Record the result for a finished case."""
         state = self._case_states[case_id]
         arrival = self._case_arrivals.get(case_id, sim_time)
 
@@ -465,35 +454,39 @@ class SimulationEngine:
             sim_start=arrival,
             sim_end=sim_time,
             queue_time_s=self._case_queue_time.get(case_id, 0.0),
+            work_time_s=self._case_work_time.get(case_id, 0.0),
             event_log=state["event_log"],
         )
         self._results.append(result)
 
         path = "->".join(e["concept_name"] for e in state["event_log"])
         logger.info(
-            "%s | COMPLETE | %s | reworks=%d | steps=%d | cycle=%.1fh | queue=%.1fh | path: %s",
+            "%s | COMPLETE | %s | reworks=%d | steps=%d | cycle=%.1fh | "
+            "work=%.1fh | queue=%.1fh | path: %s",
             case_id, state["status"].upper(), state["rework_count"],
             self._step_counts.get(case_id, 0),
             (sim_time - arrival) / 3600,
-            self._case_queue_time.get(case_id, 0) / 3600,
+            result.work_time_s / 3600,
+            result.queue_time_s / 3600,
             path,
         )
 
-    # ── Main loop ─────────────────────────────────
+    # -- Main loop -----------------------------
 
     def run(self, seed: int = 42) -> list[CaseResult]:
         """Run the discrete event simulation. Returns all case results."""
         rng = np.random.default_rng(seed)
 
-        print(f"\n{'=' * 60}")
-        print("  DES Engine — Multi-LLM-Agent BPS")
+        print(f"\n{'=' * 62}")
+        print("  DES Engine - Multi-LLM-Agent BPS")
         print(f"  Model: {self.config.model}")
         print(f"  Cases: {len(self.cases)} | Workers: "
               f"{self.config.n_junior_clerks} JC + "
               f"{self.config.n_senior_clerks} SC + "
               f"{self.config.n_credit_officers} CO")
         print(f"  Mean inter-arrival: {self.config.mean_interarrival_s / 60:.0f} min")
-        print(f"{'=' * 60}\n")
+        print(f"  Duration source: {self.config.duration_source}")
+        print(f"{'=' * 62}\n")
 
         self._schedule_arrivals(rng)
 
@@ -503,7 +496,7 @@ class SimulationEngine:
 
             if self._events_processed > self.config.max_events:
                 logger.warning(
-                    "Global event limit (%d) reached — stopping",
+                    "Global event limit (%d) reached - stopping",
                     self.config.max_events,
                 )
                 break
@@ -522,7 +515,6 @@ class SimulationEngine:
         return self._results
 
     def _print_progress(self):
-        """Print each completion, plus a heartbeat every 50 events."""
         completed = len(self._results)
         total = len(self.cases)
 
@@ -532,6 +524,7 @@ class SimulationEngine:
                 f"  [{completed:3d}/{total}] {r.case_id} -> "
                 f"{r.status.upper():8s} | {r.n_steps} steps | "
                 f"cycle {(r.sim_end - r.sim_start) / 3600:.1f}h | "
+                f"work {r.work_time_s / 3600:.1f}h | "
                 f"queue {r.queue_time_s / 3600:.1f}h"
             )
             self._last_printed = completed
@@ -548,24 +541,50 @@ class SimulationEngine:
         rejected = sum(1 for r in self._results if r.status == "rejected")
         total = len(self._results)
 
-        print(f"\n{'-' * 60}")
+        print(f"\n{'-' * 62}")
         print(f"  Completed: {total}/{len(self.cases)}")
         print(f"  Approved: {approved} | Rejected: {rejected}")
         if total:
             print(f"  Avg steps/case: {sum(r.n_steps for r in self._results) / total:.1f}")
             print(f"  Avg cycle time: {sum(r.sim_end - r.sim_start for r in self._results) / total / 3600:.1f}h")
+            print(f"  Avg work time:  {sum(r.work_time_s for r in self._results) / total / 3600:.1f}h")
             print(f"  Avg queue time: {sum(r.queue_time_s for r in self._results) / total / 3600:.1f}h")
         print(f"  Events processed: {self._events_processed}")
         print(f"  Event log entries: {len(self._global_event_log)}")
-        print(f"{'=' * 60}\n")
+        if self.config.duration_source == "llm":
+            print(f"  Duration fallbacks: {self._duration_fallbacks}")
+        print(f"{'=' * 62}\n")
 
-    # ── Export ────────────────────────────────────
+    # -- Duration analysis ---------------------
+
+    def duration_dataframe(self) -> pd.DataFrame:
+        """
+        Every duration the agents estimated, by tool. Use this to compare
+        LLM estimates against the BPIC-fitted distributions.
+        """
+        if not self._duration_samples:
+            return pd.DataFrame(columns=["tool", "minutes"])
+        return pd.DataFrame(self._duration_samples, columns=["tool", "minutes"])
+
+    def duration_summary(self) -> pd.DataFrame:
+        """Per-tool statistics of the estimates the agents produced."""
+        df = self.duration_dataframe()
+        if df.empty:
+            return df
+        return (
+            df.groupby("tool")["minutes"]
+              .agg(n="count", mean="mean", std="std", min="min", max="max")
+              .round(1)
+              .reset_index()
+        )
+
+    # -- Export --------------------------------
 
     def export_xes(self, filename: str = "simulation.xes") -> Path:
         """Export the accumulated event log to XES via PM4Py."""
         import pm4py
         if not self._global_event_log:
-            raise RuntimeError("No data — run the simulation first.")
+            raise RuntimeError("No data - run the simulation first.")
 
         df = pd.DataFrame(self._global_event_log).rename(columns={
             "case_concept_name":    "case:concept:name",
@@ -574,7 +593,7 @@ class SimulationEngine:
             "org_resource":         "org:resource",
             "lifecycle_transition": "lifecycle:transition",
         })
-        df["time:timestamp"] = pd.to_datetime(df["time:timestamp"], utc=True)
+        df["time:timestamp"] = pd.to_datetime(df["time:timestamp"], format="ISO8601", utc=True)
         df = df.sort_values(["case:concept:name", "time:timestamp"])
 
         out = self.output_dir / filename
@@ -583,7 +602,6 @@ class SimulationEngine:
         return out
 
     def export_json(self, filename: str = "simulation.json") -> Path:
-        """Export the event log as JSON for debugging."""
         out = self.output_dir / filename
         with open(out, "w") as f:
             json.dump(self._global_event_log, f, indent=2, default=str)
@@ -591,7 +609,7 @@ class SimulationEngine:
         return out
 
     def summary_dataframe(self) -> pd.DataFrame:
-        """One row per case, for the console summary and later analysis."""
+        """One row per case."""
         return pd.DataFrame([{
             "case_id":       r.case_id,
             "status":        r.status,
@@ -599,6 +617,7 @@ class SimulationEngine:
             "n_steps":       r.n_steps,
             "n_log_entries": r.n_log_entries,
             "cycle_time_h":  round((r.sim_end - r.sim_start) / 3600, 2),
+            "work_time_h":   round(r.work_time_s / 3600, 2),
             "queue_time_h":  round(r.queue_time_s / 3600, 2),
             "wall_time_s":   r.wall_time_s,
         } for r in self._results])
