@@ -1,22 +1,27 @@
 """
 run_des.py
 ----------
-Run the Discrete Event Simulation engine.
+Run the Discrete Event Simulation engine on the loan application process.
+
+The engine itself is process-agnostic. This script picks a process
+definition, builds a run configuration for it, and reports the results.
+Simulating a different process means importing a different definition
+here - the engine is not touched.
 
 Usage:
-    # Synthetic cases:
+    # Synthetic cases
     python run_des.py --cases 20
 
-    # Real BPIC 2017 cases:
+    # Real BPIC 2017 cases
     python run_des.py --cases 100 --bpic data/bpic/BPI_Challenge_2017.xes
 
-    # Agents estimate their own durations (default):
+    # Agents estimate their own durations (default)
     python run_des.py --cases 20 --durations llm
 
-    # Baseline: durations sampled from BPIC-fitted distributions
+    # Baseline: durations sampled from fitted distributions
     python run_des.py --cases 20 --durations distribution
 
-    # Custom workforce and arrival rate:
+    # Custom workforce and arrival rate
     python run_des.py --cases 50 --jc 3 --sc 2 --co 1 --arrival 30
 """
 
@@ -27,6 +32,7 @@ from dotenv import load_dotenv
 
 from src.queue.simulation_engine import SimulationEngine, EngineConfig
 from src.clock.simulation_clock import SimulationClock
+from src.process.loan_application import LOAN_PROCESS
 from src.simulation_controller import generate_synthetic_case, load_bpic_cases
 from src.logger import setup_logging
 
@@ -35,20 +41,20 @@ load_dotenv()
 
 def parse_args():
     p = argparse.ArgumentParser(description="Multi-LLM-Agent BPS - DES Engine")
-    p.add_argument("--cases",     type=int,   default=20,     help="Number of cases to simulate")
-    p.add_argument("--bpic",      type=str,   default=None,   help="Path to BPIC XES file")
-    p.add_argument("--model",     type=str,   default=None,   help="LLM model name")
-    p.add_argument("--seed",      type=int,   default=42,     help="Random seed")
-    p.add_argument("--output",    type=str,   default="output", help="Output directory")
-    p.add_argument("--jc",        type=int,   default=2,      help="Number of Junior Clerks")
-    p.add_argument("--sc",        type=int,   default=1,      help="Number of Senior Clerks")
-    p.add_argument("--co",        type=int,   default=1,      help="Number of Credit Officers")
-    p.add_argument("--arrival",   type=float, default=60.0,   help="Mean inter-arrival time (minutes)")
+    p.add_argument("--cases",   type=int,   default=20,       help="Number of cases to simulate")
+    p.add_argument("--bpic",    type=str,   default=None,     help="Path to BPIC XES file")
+    p.add_argument("--model",   type=str,   default=None,     help="LLM model name")
+    p.add_argument("--seed",    type=int,   default=42,       help="Random seed")
+    p.add_argument("--output",  type=str,   default="output", help="Output directory")
+    p.add_argument("--jc",      type=int,   default=2,        help="Number of Junior Clerks")
+    p.add_argument("--sc",      type=int,   default=1,        help="Number of Senior Clerks")
+    p.add_argument("--co",      type=int,   default=1,        help="Number of Credit Officers")
+    p.add_argument("--arrival", type=float, default=60.0,     help="Mean inter-arrival time (minutes)")
     p.add_argument(
         "--durations", type=str, default="llm", choices=["llm", "distribution"],
         help="Where activity durations come from (default: llm)",
     )
-    p.add_argument("--verbose",   action="store_true",        help="Print debug logs to console")
+    p.add_argument("--verbose", action="store_true",          help="Print debug logs to console")
     return p.parse_args()
 
 
@@ -59,7 +65,7 @@ def main():
     model    = args.model or os.getenv("LLM_MODEL", "gpt-4o-mini")
     base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
-    # Prepare cases
+    # Cases
     if args.bpic:
         cases = load_bpic_cases(args.bpic, max_cases=args.cases)
         print(f"  Loaded {len(cases)} cases from BPIC")
@@ -72,9 +78,11 @@ def main():
         print(f"  Generated {len(cases)} synthetic cases (seed={args.seed})")
 
     config = EngineConfig(
-        n_junior_clerks=args.jc,
-        n_senior_clerks=args.sc,
-        n_credit_officers=args.co,
+        workforce={
+            "junior_clerk":   args.jc,
+            "senior_clerk":   args.sc,
+            "credit_officer": args.co,
+        },
         mean_interarrival_s=args.arrival * 60,
         duration_source=args.durations,
         model=model,
@@ -85,6 +93,7 @@ def main():
 
     engine = SimulationEngine(
         cases=cases,
+        process=LOAN_PROCESS,
         config=config,
         clock=clock,
         output_dir=args.output,
@@ -109,14 +118,12 @@ def main():
         print(f"  Avg work time:  {df['work_time_h'].mean():.1f}h")
         print(f"  Avg queue time: {df['queue_time_h'].mean():.1f}h")
 
-    # Duration estimates by tool (only meaningful with --durations llm)
+    # Duration estimates by tool (meaningful with --durations llm)
     dur = engine.duration_summary()
     if not dur.empty:
         print("\n  Agent duration estimates (minutes):")
         print(dur.to_string(index=False))
-        engine.duration_dataframe().to_csv(
-            f"{args.output}/durations.csv", index=False,
-        )
+        engine.duration_dataframe().to_csv(f"{args.output}/durations.csv", index=False)
         print(f"\n  Raw estimates -> {args.output}/durations.csv")
 
     print()

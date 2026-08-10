@@ -3,31 +3,36 @@ simulation_engine.py
 --------------------
 Discrete Event Simulation (DES) engine for multi-LLM-agent BPS.
 
-Event-based simulator where:
-  - multiple cases run concurrently
-  - each role has one shared FIFO queue feeding several workers
-  - workers have working hours (busyness clock)
-  - time advances by jumping between events, not step by step
+Domain-agnostic by construction: this module names no role, no activity
+and no case attribute. Everything process-specific arrives through a
+ProcessDefinition, so the same engine simulates a loan application, a
+hospital admission or a support workflow without modification.
+
+What it does own:
+  - the event queue and the simulation timeline
+  - one shared FIFO queue per role feeding several workers
+  - working hours, including suspending work across shift boundaries
+  - deciding how long each activity takes and when it finishes
+  - emitting the event log
 
 CLOCK OWNERSHIP
-    The engine is the single owner of the simulation timeline. For each
-    step it determines the hands-on work time exactly once, spreads that
-    work across the worker's shift windows, schedules the completion
-    event, and stamps the XES entry with the completion time.
+    For each step the engine determines the hands-on work time exactly
+    once, spreads it across the worker's shift windows, schedules the
+    completion event, and stamps the XES entry with the completion time.
+    The executor performs the LLM call and never touches a clock.
 
 DURATION SOURCE
-    config.duration_source selects where the work time comes from:
+    config.duration_source selects where work time comes from:
 
-      "llm"           the agent's own duration_minutes estimate on the
-                      tool call. Time estimation becomes part of the
-                      agent's cognition.
-      "distribution"  a sample from the BPIC-fitted log-normal in
-                      SimulationClock. This is the AgentSimulator-style
-                      baseline.
+      "llm"           the agent's own duration_minutes estimate.
+                      Time estimation becomes part of the agent's
+                      cognition rather than a statistical module.
+      "distribution"  a sample from the fitted log-normal in
+                      SimulationClock - the AgentSimulator-style baseline.
 
-    Both run on identical cases, so the two can be compared directly.
-    Under "llm", a missing or invalid estimate falls back to the
-    distribution and is counted in `duration_fallbacks`.
+    Both run on identical cases, so the two are directly comparable.
+    Under "llm" an unusable estimate falls back to the distribution and
+    is counted in duration_fallbacks.
 """
 
 from __future__ import annotations
@@ -48,32 +53,10 @@ from .agent_pool import (
 from .step_executor import StepExecutor, merge_state
 from ..observer.observer import build_xes_entry
 from ..clock.simulation_clock import SimulationClock
+from ..process.definition import ProcessDefinition
 from ..state import ProcessState
 
 logger = logging.getLogger("bps.engine")
-
-
-# -------------------------------------------------
-# Process flow constraints
-# -------------------------------------------------
-
-VALID_TRANSITIONS: dict[str, set[str]] = {
-    "junior_clerk":   {"junior_clerk", "senior_clerk"},
-    "senior_clerk":   {"senior_clerk", "credit_officer", "junior_clerk"},
-    "credit_officer": {"credit_officer"},
-}
-
-
-def validate_transition(current_role: str, next_role: str, case_id: str) -> bool:
-    """Check a transition against the process flow; logs if invalid."""
-    valid = VALID_TRANSITIONS.get(current_role, set())
-    if next_role not in valid:
-        logger.error(
-            "%s | INVALID TRANSITION: %s -> %s (allowed: %s)",
-            case_id, current_role, next_role, valid,
-        )
-        return False
-    return True
 
 
 # -------------------------------------------------
@@ -82,21 +65,24 @@ def validate_transition(current_role: str, next_role: str, case_id: str) -> bool
 
 @dataclass
 class EngineConfig:
-    """Configuration for the simulation engine."""
-    # Workforce
-    n_junior_clerks: int = 2
-    n_senior_clerks: int = 1
-    n_credit_officers: int = 1
+    """
+    Run configuration. Nothing here names a specific role: the workforce
+    is a role -> headcount map filled in from the ProcessDefinition's
+    roles by the caller.
+    """
+    # role -> number of workers. Empty means one worker per role.
+    workforce: dict[str, int] = field(default_factory=dict)
 
-    # Working hours
-    jc_schedule: WorkSchedule = field(default_factory=lambda: WorkSchedule(8.0, 17.0))
-    sc_schedule: WorkSchedule = field(default_factory=lambda: WorkSchedule(8.0, 17.0))
-    co_schedule: WorkSchedule = field(default_factory=lambda: WorkSchedule(9.0, 17.0))
+    # role -> WorkSchedule override. Falls back to the definition.
+    schedules: dict[str, WorkSchedule] = field(default_factory=dict)
 
     # Case arrivals
     mean_interarrival_s: float = 3600.0
 
-    # Where activity durations come from: "llm" or "distribution"
+    # Office hours used to snap arrivals to plausible submission times
+    arrival_window: WorkSchedule = field(default_factory=lambda: WorkSchedule(8.0, 17.0))
+
+    # "llm" or "distribution"
     duration_source: str = "llm"
 
     # Safety limits
@@ -134,9 +120,9 @@ class CaseResult:
 
 class SimulationEngine:
     """
-    Discrete event simulation engine for multi-LLM-agent BPS.
+    Discrete event simulation engine.
 
-        engine = SimulationEngine(cases, config, clock)
+        engine = SimulationEngine(cases, LOAN_PROCESS, config, clock)
         results = engine.run()
         engine.export_xes("simulation.xes")
     """
@@ -144,10 +130,18 @@ class SimulationEngine:
     def __init__(
         self,
         cases: list[dict],
+        process: ProcessDefinition,
         config: EngineConfig | None = None,
         clock: SimulationClock | None = None,
         output_dir: str = "output",
     ):
+        problems = process.validate()
+        if problems:
+            raise ValueError(
+                "Invalid process definition:\n  - " + "\n  - ".join(problems)
+            )
+
+        self.process = process
         self.config = config or EngineConfig()
         self.cases = cases
         self.output_dir = Path(output_dir)
@@ -171,7 +165,7 @@ class SimulationEngine:
         self._scheduled_shifts: set[str] = set()
         self._last_printed = 0
         self._duration_fallbacks = 0
-        self._duration_samples: list[tuple[str, float]] = []  # (tool, minutes)
+        self._duration_samples: list[tuple[str, float]] = []
 
         self._build_agent_pool()
 
@@ -190,14 +184,12 @@ class SimulationEngine:
         )
 
     def _build_agent_pool(self):
-        self._executor = StepExecutor(self._build_llm())
+        """One executor shared by everyone, plus N worker slots per role."""
+        self._executor = StepExecutor(self._build_llm(), self.process)
 
-        roles = [
-            ("junior_clerk", self.config.n_junior_clerks, self.config.jc_schedule),
-            ("senior_clerk", self.config.n_senior_clerks, self.config.sc_schedule),
-            ("credit_officer", self.config.n_credit_officers, self.config.co_schedule),
-        ]
-        for role, count, schedule in roles:
+        for role in self.process.roles:
+            count = self.config.workforce.get(role, 1)
+            schedule = self.config.schedules.get(role) or self.process.schedule_for(role)
             for i in range(count):
                 self._agent_pool.add_worker(AgentWorker(
                     worker_id=f"{role}_{i + 1}",
@@ -205,11 +197,23 @@ class SimulationEngine:
                     schedule=schedule,
                 ))
 
+    # -- Routing -------------------------------
+
+    def _validate_transition(self, current_role: str, next_role: str, case_id: str) -> bool:
+        valid = self.process.valid_transitions.get(current_role, set())
+        if next_role not in valid:
+            logger.error(
+                "%s | INVALID TRANSITION: %s -> %s (allowed: %s)",
+                case_id, current_role, next_role, valid,
+            )
+            return False
+        return True
+
     # -- Case arrivals -------------------------
 
     def _schedule_arrivals(self, rng: np.random.Generator):
-        """Schedule arrivals as a Poisson process, snapped to office hours."""
-        office = WorkSchedule(8.0, 17.0)
+        """Poisson arrivals, snapped into the submission window."""
+        window = self.config.arrival_window
         current_time = self._clock.current
 
         for case in self.cases:
@@ -217,8 +221,10 @@ class SimulationEngine:
 
             dt = datetime.fromtimestamp(current_time, tz=timezone.utc)
             hour = dt.hour + dt.minute / 60.0
-            if hour >= office.shift_end or hour < office.shift_start or dt.weekday() >= 5:
-                current_time = compute_next_shift_start(current_time, office)
+            if (hour >= window.shift_end
+                    or hour < window.shift_start
+                    or dt.weekday() in window.days_off):
+                current_time = compute_next_shift_start(current_time, window)
 
             self._event_queue.schedule_arrival(
                 time=current_time,
@@ -231,34 +237,10 @@ class SimulationEngine:
                 datetime.fromtimestamp(current_time, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
             )
 
-    def _make_initial_state(self, case_data: dict) -> ProcessState:
-        application = {
-            "case_id":          case_data["case_id"],
-            "amount_requested": case_data["amount_requested"],
-            "loan_goal":        case_data["loan_goal"],
-            "application_type": case_data.get("application_type", "New credit"),
-        }
-        return ProcessState(
-            application=application,
-            credit_bureau_data=case_data.get("credit_bureau_data"),
-            credit_checked=False,
-            status="pending", current_agent="junior_clerk",
-            messages=[], agent_history=[], sim_clock=0.0, event_log=[],
-            rework_count=0, rejection_reason=None, next_agent=None,
-        )
-
     # -- Duration resolution -------------------
 
     def _resolve_work_seconds(self, tool_name: str | None, tool_output: dict) -> float:
-        """
-        Hands-on work time for one activity, per config.duration_source.
-
-        "llm"           the agent's duration_minutes estimate
-        "distribution"  a sample from the BPIC-fitted log-normal
-
-        An unusable LLM estimate falls back to the distribution and is
-        counted, so the fallback rate is reportable.
-        """
+        """Hands-on work time for one activity, per config.duration_source."""
         if self.config.duration_source == "llm":
             minutes = tool_output.get("duration_minutes")
             if isinstance(minutes, (int, float)) and minutes > 0:
@@ -275,10 +257,10 @@ class SimulationEngine:
     # -- Event handlers ------------------------
 
     def _handle_arrival(self, event: SimEvent):
-        """A new case enters the system and joins the junior clerk queue."""
+        """A new case enters the system and joins the entry role's queue."""
         case_id = event.case_id
 
-        self._case_states[case_id] = self._make_initial_state(event.data)
+        self._case_states[case_id] = self.process.initial_state(event.data)
         self._case_arrivals[case_id] = event.time
         self._case_queue_time[case_id] = 0.0
         self._case_queue_start[case_id] = event.time
@@ -286,18 +268,12 @@ class SimulationEngine:
         self._case_work_time[case_id] = 0.0
         self._step_counts[case_id] = 0
 
-        self._agent_pool.enqueue_case("junior_clerk", case_id)
-        logger.info(
-            "%s | ARRIVED | EUR %.0f | goal=%s | type=%s",
-            case_id,
-            event.data.get("amount_requested", 0),
-            event.data.get("loan_goal", "?"),
-            event.data.get("application_type", "?"),
-        )
+        self._agent_pool.enqueue_case(self.process.entry_role, case_id)
+        logger.info("%s | ARRIVED", case_id)
         self._try_dispatch_all(event.time)
 
     def _handle_step_complete(self, event: SimEvent):
-        """A worker finished a step: stamp the XES entry and route the case."""
+        """A worker finished a step: record the event and route the case."""
         case_id = event.case_id
         self._agent_pool.release(event.worker_id)
 
@@ -305,32 +281,33 @@ class SimulationEngine:
         step_result = event.data
         next_role = step_result.get("next_role")
 
-        # Stamp the XES entry with DES time, only if this step produced
-        # a new action (a step where the LLM returned text instead of a
-        # tool call must not re-log the previous action).
+        # Record the event, unless this step produced no new action or the
+        # tool is a silent internal handover.
         if step_result.get("produced_action") and state["agent_history"]:
             last_action = state["agent_history"][-1]
             dispatch_time = step_result.get("_dispatch_time", event.time)
             last_action["sim_timestamp"] = event.time
             last_action["real_duration"] = event.time - dispatch_time
 
-            xes_entry = dict(build_xes_entry(last_action))
-            self._global_event_log.append(xes_entry)
+            if not self.process.is_silent(last_action["tool_name"]):
+                xes_entry = dict(build_xes_entry(
+                    last_action,
+                    self.process.activity_map,
+                    self.process.resource_map,
+                ))
+                self._global_event_log.append(xes_entry)
+                state = merge_state(state, {"event_log": [xes_entry]})
 
-            state = merge_state(state, {
-                "event_log": [xes_entry],
-                "sim_clock": event.time,
-            })
+            state = merge_state(state, {"sim_clock": event.time})
             self._case_states[case_id] = state
 
         if next_role is None:
             self._complete_case(case_id, event.time)
         else:
             current_role = state.get("current_agent", "unknown")
-            if not validate_transition(current_role, next_role, case_id):
+            if not self._validate_transition(current_role, next_role, case_id):
                 logger.error("%s | Forcing case to rejected (invalid transition)", case_id)
-                state = merge_state(state, {"status": "rejected"})
-                self._case_states[case_id] = state
+                self._case_states[case_id] = merge_state(state, {"status": "rejected"})
                 self._complete_case(case_id, event.time)
             else:
                 self._case_queue_start[case_id] = event.time
@@ -373,12 +350,10 @@ class SimulationEngine:
         state = self._case_states[case_id]
         self._step_counts[case_id] = self._step_counts.get(case_id, 0) + 1
 
-        # Accumulate queue waiting time
         if case_id in self._case_queue_start:
             wait = sim_time - self._case_queue_start[case_id]
             self._case_queue_time[case_id] = self._case_queue_time.get(case_id, 0) + wait
 
-        # Safety net
         if self._step_counts[case_id] > self.config.max_steps_per_case:
             logger.warning("%s | MAX_STEPS reached - forcing completion", case_id)
             self._case_states[case_id] = merge_state(state, {"status": "rejected"})
@@ -391,7 +366,6 @@ class SimulationEngine:
             case_id, worker.worker_id, self._step_counts[case_id],
         )
 
-        # LLM call - no clock side effects inside
         t0 = time.time()
         try:
             updated_state, next_role = self._executor.execute_step(state, worker.role)
@@ -409,7 +383,6 @@ class SimulationEngine:
         tool_name = last_action["tool_name"] if last_action else None
         tool_output = last_action["tool_output"] if last_action else {}
 
-        # Hands-on work time, then spread across the worker's shifts
         work_seconds = self._resolve_work_seconds(tool_name, tool_output)
         self._case_work_time[case_id] = self._case_work_time.get(case_id, 0.0) + work_seconds
 
@@ -474,18 +447,20 @@ class SimulationEngine:
     # -- Main loop -----------------------------
 
     def run(self, seed: int = 42) -> list[CaseResult]:
-        """Run the discrete event simulation. Returns all case results."""
         rng = np.random.default_rng(seed)
 
+        workforce = ", ".join(
+            f"{self.config.workforce.get(r, 1)} {r}" for r in self.process.roles
+        )
         print(f"\n{'=' * 62}")
         print("  DES Engine - Multi-LLM-Agent BPS")
+        print(f"  Process: {self.process.name}")
         print(f"  Model: {self.config.model}")
-        print(f"  Cases: {len(self.cases)} | Workers: "
-              f"{self.config.n_junior_clerks} JC + "
-              f"{self.config.n_senior_clerks} SC + "
-              f"{self.config.n_credit_officers} CO")
+        print(f"  Cases: {len(self.cases)} | Workforce: {workforce}")
         print(f"  Mean inter-arrival: {self.config.mean_interarrival_s / 60:.0f} min")
         print(f"  Duration source: {self.config.duration_source}")
+        if self.process.silent_tools:
+            print(f"  Silent tools: {', '.join(sorted(self.process.silent_tools))}")
         print(f"{'=' * 62}\n")
 
         self._schedule_arrivals(rng)
@@ -537,13 +512,14 @@ class SimulationEngine:
             )
 
     def _print_summary(self):
-        approved = sum(1 for r in self._results if r.status == "approved")
-        rejected = sum(1 for r in self._results if r.status == "rejected")
         total = len(self._results)
+        by_status: dict[str, int] = {}
+        for r in self._results:
+            by_status[r.status] = by_status.get(r.status, 0) + 1
 
         print(f"\n{'-' * 62}")
         print(f"  Completed: {total}/{len(self.cases)}")
-        print(f"  Approved: {approved} | Rejected: {rejected}")
+        print("  " + " | ".join(f"{k}: {v}" for k, v in sorted(by_status.items())))
         if total:
             print(f"  Avg steps/case: {sum(r.n_steps for r in self._results) / total:.1f}")
             print(f"  Avg cycle time: {sum(r.sim_end - r.sim_start for r in self._results) / total / 3600:.1f}h")
@@ -558,10 +534,7 @@ class SimulationEngine:
     # -- Duration analysis ---------------------
 
     def duration_dataframe(self) -> pd.DataFrame:
-        """
-        Every duration the agents estimated, by tool. Use this to compare
-        LLM estimates against the BPIC-fitted distributions.
-        """
+        """Every duration the agents estimated, by tool."""
         if not self._duration_samples:
             return pd.DataFrame(columns=["tool", "minutes"])
         return pd.DataFrame(self._duration_samples, columns=["tool", "minutes"])
@@ -581,7 +554,6 @@ class SimulationEngine:
     # -- Export --------------------------------
 
     def export_xes(self, filename: str = "simulation.xes") -> Path:
-        """Export the accumulated event log to XES via PM4Py."""
         import pm4py
         if not self._global_event_log:
             raise RuntimeError("No data - run the simulation first.")
@@ -593,7 +565,9 @@ class SimulationEngine:
             "org_resource":         "org:resource",
             "lifecycle_transition": "lifecycle:transition",
         })
-        df["time:timestamp"] = pd.to_datetime(df["time:timestamp"], format="ISO8601", utc=True)
+        df["time:timestamp"] = pd.to_datetime(
+            df["time:timestamp"], format="ISO8601", utc=True,
+        )
         df = df.sort_values(["case:concept:name", "time:timestamp"])
 
         out = self.output_dir / filename
@@ -609,7 +583,6 @@ class SimulationEngine:
         return out
 
     def summary_dataframe(self) -> pd.DataFrame:
-        """One row per case."""
         return pd.DataFrame([{
             "case_id":       r.case_id,
             "status":        r.status,
