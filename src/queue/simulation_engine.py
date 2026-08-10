@@ -32,7 +32,8 @@ from datetime import datetime, timezone
 
 from .events import EventQueue, EventType, SimEvent
 from .agent_pool import (
-    AgentPool, AgentWorker, WorkSchedule, compute_next_shift_start,
+    AgentPool, AgentWorker, WorkSchedule,
+    compute_next_shift_start, compute_finish_time,
 )
 from .process_graph import ProcessStepExecutor
 from ..observer.observer import build_xes_entry
@@ -415,14 +416,22 @@ class SimulationEngine:
             if produced_action else None
         )
 
-        # ── Sample the activity duration ONCE ──
-        activity_duration = self._clock.sample_duration(tool_name or "_default")
-        finish_time = sim_time + activity_duration
+        # ── Sample the activity WORK time ONCE ──
+        # This is actual working seconds, not elapsed wall time.
+        work_seconds = self._clock.sample_duration(tool_name or "_default")
+
+        # Spread the work across the worker's shift windows. An activity
+        # that does not fit before the end of the day is suspended and
+        # resumed at the next shift start, so no event lands after hours.
+        finish_time = compute_finish_time(sim_time, work_seconds, worker.schedule)
+        elapsed = finish_time - sim_time
+        suspended = elapsed > work_seconds + 60   # crossed at least one shift boundary
 
         logger.info(
-            "%s | %s on %s | tool=%s | duration=%.0fs (%.0fmin) | wall=%.1fs | next=%s",
+            "%s | %s on %s | tool=%s | work=%.0fmin | elapsed=%.0fmin%s | wall=%.1fs | next=%s",
             case_id, worker.worker_id, worker.role,
-            tool_name or "none", activity_duration, activity_duration / 60,
+            tool_name or "none", work_seconds / 60, elapsed / 60,
+            " (suspended overnight)" if suspended else "",
             wall_time, next_role or "END",
         )
 

@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 from src.queue.simulation_engine import SimulationEngine, EngineConfig
 from src.queue.agent_pool import WorkSchedule
 from src.clock.simulation_clock import SimulationClock
-from simulation_controller import generate_synthetic_case, load_bpic_cases
+from src.simulation_controller import generate_synthetic_case, load_bpic_cases
 from src.logger import setup_logging
 
 load_dotenv()
