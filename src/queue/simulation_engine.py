@@ -54,6 +54,7 @@ from .step_executor import StepExecutor, merge_state
 from ..observer.observer import build_xes_entry
 from ..clock.simulation_clock import SimulationClock
 from ..process.definition import ProcessDefinition
+from ..tools.duration_reference import resolve_minutes, DURATION_ANCHOR
 from ..state import ProcessState
 
 logger = logging.getLogger("bps.engine")
@@ -82,12 +83,21 @@ class EngineConfig:
     # Office hours used to snap arrivals to plausible submission times
     arrival_window: WorkSchedule = field(default_factory=lambda: WorkSchedule(8.0, 17.0))
 
-    # "llm" or "distribution"
-    duration_source: str = "llm"
+    # Where hands-on work time comes from:
+    #   "complexity"    agent rates the case 1-5, engine scales an anchor
+    #   "llm"           agent's own absolute estimate, used as given
+    #   "distribution"  sample from the fitted log-normal
+    duration_source: str = "complexity"
+
+    # Multiplicative lognormal noise on the resolved work time, as a
+    # coefficient of variation. 0.0 disables it. Covers the operational
+    # scatter no judgement can produce: interruptions, a phone call
+    # mid-task, a colleague stopping by.
+    duration_noise_cv: float = 0.0
 
     # Safety limits
     max_steps_per_case: int = 20
-    max_events: int = 10_000
+    max_events: int = 10000
 
     # LLM
     model: str = "gpt-4o-mini"
@@ -165,7 +175,8 @@ class SimulationEngine:
         self._scheduled_shifts: set[str] = set()
         self._last_printed = 0
         self._duration_fallbacks = 0
-        self._duration_samples: list[tuple[str, float]] = []
+        self._duration_samples: list[dict] = []
+        self._noise_rng = np.random.default_rng(20250729)
 
         self._build_agent_pool()
 
@@ -239,20 +250,76 @@ class SimulationEngine:
 
     # -- Duration resolution -------------------
 
-    def _resolve_work_seconds(self, tool_name: str | None, tool_output: dict) -> float:
-        """Hands-on work time for one activity, per config.duration_source."""
-        if self.config.duration_source == "llm":
-            minutes = tool_output.get("duration_minutes")
-            if isinstance(minutes, (int, float)) and minutes > 0:
-                self._duration_samples.append((tool_name or "unknown", float(minutes)))
-                return float(minutes) * 60.0
-            self._duration_fallbacks += 1
-            logger.warning(
-                "No usable duration_minutes for %s - falling back to distribution",
-                tool_name or "unknown",
-            )
+    def _resolve_work_seconds(
+        self, tool_name: str | None, tool_output: dict
+    ) -> float:
+        """
+        Hands-on work time for one activity, per config.duration_source.
 
-        return self._clock.sample_duration(tool_name or "_default")
+        "complexity"   the agent rated this case 1-5; the engine
+                       multiplies the tool's anchor by that rating's
+                       factor. Judgement from the agent, scale from the
+                       reference log.
+        "llm"          the agent's own absolute estimate, used as given.
+        "distribution" a sample from the fitted log-normal.
+
+        Every branch records what the agent said, including the free
+        estimate it is never asked to act on, so calibration and
+        complexity discrimination can be reported separately.
+        """
+        source = self.config.duration_source
+        seconds: float | None = None
+        resolution = source
+
+        typical = tool_output.get("typical_duration_minutes")
+        complexity = tool_output.get("case_complexity")
+
+        if source == "complexity" and tool_name:
+            if isinstance(complexity, (int, float)) and 1 <= complexity <= 5:
+                minutes = resolve_minutes(tool_name, int(complexity))
+                if minutes is not None:
+                    seconds = minutes * 60.0
+            if seconds is None:
+                self._duration_fallbacks += 1
+                resolution = "fallback_distribution"
+                logger.warning(
+                    "No usable case_complexity for %s - falling back to distribution",
+                    tool_name,
+                )
+
+        elif source == "llm":
+            if isinstance(typical, (int, float)) and typical > 0:
+                seconds = float(typical) * 60.0
+            else:
+                self._duration_fallbacks += 1
+                resolution = "fallback_distribution"
+                logger.warning(
+                    "No usable typical_duration_minutes for %s - falling back",
+                    tool_name or "unknown",
+                )
+
+        if seconds is None:
+            seconds = self._clock.sample_duration(tool_name or "_default")
+
+        # Operational scatter, off by default
+        cv = self.config.duration_noise_cv
+        if cv > 0:
+            import math
+            sigma = math.sqrt(math.log(1 + cv ** 2))
+            seconds *= float(self._noise_rng.lognormal(-0.5 * sigma ** 2, sigma))
+
+        if tool_name:
+            self._duration_samples.append({
+                "tool":            tool_name,
+                "resolution":      resolution,
+                "agent_typical":   typical if isinstance(typical, (int, float)) else None,
+                "agent_complexity": int(complexity) if isinstance(complexity, (int, float)) else None,
+                "anchor":          DURATION_ANCHOR.get(tool_name),
+                "resolved_minutes": round(seconds / 60, 1),
+                "rationale":       str(tool_output.get("complexity_rationale", ""))[:120],
+            })
+
+        return seconds
 
     # -- Event handlers ------------------------
 
@@ -527,29 +594,57 @@ class SimulationEngine:
             print(f"  Avg queue time: {sum(r.queue_time_s for r in self._results) / total / 3600:.1f}h")
         print(f"  Events processed: {self._events_processed}")
         print(f"  Event log entries: {len(self._global_event_log)}")
-        if self.config.duration_source == "llm":
+        if self.config.duration_source in ("llm", "complexity"):
             print(f"  Duration fallbacks: {self._duration_fallbacks}")
         print(f"{'=' * 62}\n")
 
     # -- Duration analysis ---------------------
 
     def duration_dataframe(self) -> pd.DataFrame:
-        """Every duration the agents estimated, by tool."""
+        """
+        One row per activity: what the agent said and what the engine
+        used. Columns:
+            tool, resolution, agent_typical, agent_complexity,
+            anchor, resolved_minutes, rationale
+        """
         if not self._duration_samples:
-            return pd.DataFrame(columns=["tool", "minutes"])
-        return pd.DataFrame(self._duration_samples, columns=["tool", "minutes"])
+            return pd.DataFrame()
+        return pd.DataFrame(self._duration_samples)
 
     def duration_summary(self) -> pd.DataFrame:
-        """Per-tool statistics of the estimates the agents produced."""
+        """
+        Per-tool view of the two abilities being measured:
+
+            agent_typical vs anchor  absolute calibration
+            complexity spread        discrimination between cases
+        """
         df = self.duration_dataframe()
         if df.empty:
             return df
-        return (
-            df.groupby("tool")["minutes"]
-              .agg(n="count", mean="mean", std="std", min="min", max="max")
-              .round(1)
-              .reset_index()
-        )
+        out = df.groupby("tool").agg(
+            n=("tool", "count"),
+            anchor=("anchor", "first"),
+            typical_mean=("agent_typical", "mean"),
+            cplx_mean=("agent_complexity", "mean"),
+            cplx_std=("agent_complexity", "std"),
+            cplx_min=("agent_complexity", "min"),
+            cplx_max=("agent_complexity", "max"),
+            used_mean=("resolved_minutes", "mean"),
+            used_std=("resolved_minutes", "std"),
+        ).round(2).reset_index()
+        return out
+
+    def complexity_distribution(self) -> pd.DataFrame:
+        """How often each 1-5 rating was used, across all activities."""
+        df = self.duration_dataframe()
+        if df.empty or "agent_complexity" not in df:
+            return pd.DataFrame()
+        counts = df["agent_complexity"].value_counts().sort_index()
+        return pd.DataFrame({
+            "complexity": counts.index,
+            "n": counts.values,
+            "share": (counts.values / len(df) * 100).round(1),
+        })
 
     # -- Export --------------------------------
 

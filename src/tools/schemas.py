@@ -8,20 +8,24 @@ Information asymmetry
   - SC tools: include CheckCreditScore, which reveals bureau data
   - CO tools: full information (application + credit + handoff history)
 
-Duration estimation
-  Every tool carries `duration_minutes`: the agent's own estimate of how
-  much hands-on working time the activity took for THIS case. This makes
-  time estimation part of the agent's cognition rather than a statistical
-  module bolted on beside it.
+Timing fields
+  Every tool carries three fields about the work just performed:
 
-  The estimate is HANDS-ON WORK ONLY. Queue waiting, overnight gaps and
-  weekends are added by the simulation engine, which knows the schedule
-  and the queue state. An agent that says 45 minutes may well produce an
-  event 19 hours later in the log.
+    typical_duration_minutes  the agent's unanchored estimate of how
+                              long this KIND of task usually takes
+    complexity_rationale      one sentence on what made THIS case easy
+                              or hard, written before the rating
+    case_complexity           1-5 rating of this case against the usual
 
-  The engine can ignore these estimates and sample from BPIC-fitted
-  distributions instead (`--durations distribution`), so both approaches
-  can be compared on identical cases.
+  Only case_complexity advances the simulation clock: the engine
+  multiplies a reference anchor by the complexity multiplier. The free
+  estimate is recorded but never used, so the model's unaided
+  calibration can be reported separately from its ability to
+  discriminate complexity between cases.
+
+  The rationale sits before the rating on purpose. Filling a bare
+  numeric field invites pattern completion; writing the justification
+  first forces the judgement to be made before the number is emitted.
 """
 
 from __future__ import annotations
@@ -29,13 +33,29 @@ from enum import Enum
 from pydantic import BaseModel, Field
 
 
-# Shared constraint for every duration estimate: 1 minute to 40 hours.
-_DURATION = Field(
+# Shared timing fields. Declared once so every tool stays identical.
+_TYPICAL = Field(
     ge=1, le=2400,
     description=(
-        "Hands-on working minutes this activity took for THIS case. "
-        "Exclude any waiting, queueing or overnight gaps. "
-        "Scale it to the complexity of the case in front of you."
+        "Hands-on working minutes this KIND of task takes on an ordinary "
+        "case - not this case in particular. Exclude waiting and queueing."
+    ),
+)
+
+_RATIONALE = Field(
+    max_length=200,
+    description=(
+        "One sentence: what made THIS case easy or hard? "
+        "Write this before choosing the complexity rating."
+    ),
+)
+
+_COMPLEXITY = Field(
+    ge=1, le=5,
+    description=(
+        "How this case compares to an ordinary one: "
+        "1 unusually clean, 2 straightforward, 3 ordinary, "
+        "4 awkward, 5 difficult."
     ),
 )
 
@@ -65,7 +85,9 @@ class IntakeApplication(BaseModel):
         ),
         max_length=500,
     )
-    duration_minutes: int = _DURATION
+    typical_duration_minutes: int = _TYPICAL
+    complexity_rationale: str = _RATIONALE
+    case_complexity: int = _COMPLEXITY
 
 
 class CheckDocuments(BaseModel):
@@ -79,7 +101,9 @@ class CheckDocuments(BaseModel):
         description="Missing documents if status is 'incomplete'",
     )
     notes: str = Field(default="", max_length=500)
-    duration_minutes: int = _DURATION
+    typical_duration_minutes: int = _TYPICAL
+    complexity_rationale: str = _RATIONALE
+    case_complexity: int = _COMPLEXITY
 
 
 class ForwardCase(BaseModel):
@@ -93,7 +117,9 @@ class ForwardCase(BaseModel):
         description="'normal' or 'high' based on amount and case complexity",
         pattern="^(normal|high)$",
     )
-    duration_minutes: int = _DURATION
+    typical_duration_minutes: int = _TYPICAL
+    complexity_rationale: str = _RATIONALE
+    case_complexity: int = _COMPLEXITY
 
 
 class ReturnApplicationEarly(BaseModel):
@@ -108,7 +134,9 @@ class ReturnApplicationEarly(BaseModel):
         pattern="^(incomplete_docs|fraudulent_docs|unreasonable_request)$",
     )
     details: str = Field(max_length=400)
-    duration_minutes: int = _DURATION
+    typical_duration_minutes: int = _TYPICAL
+    complexity_rationale: str = _RATIONALE
+    case_complexity: int = _COMPLEXITY
 
 
 # -- Senior Clerk tools -------------------------
@@ -130,7 +158,9 @@ class CheckCreditScore(BaseModel):
         description="Reason for checking, or preliminary observations",
         max_length=300,
     )
-    duration_minutes: int = _DURATION
+    typical_duration_minutes: int = _TYPICAL
+    complexity_rationale: str = _RATIONALE
+    case_complexity: int = _COMPLEXITY
 
 
 class ValidateApplication(BaseModel):
@@ -146,7 +176,9 @@ class ValidateApplication(BaseModel):
         description="Assessment based on credit score, monthly cost and loan terms",
         max_length=800,
     )
-    duration_minutes: int = _DURATION
+    typical_duration_minutes: int = _TYPICAL
+    complexity_rationale: str = _RATIONALE
+    case_complexity: int = _COMPLEXITY
 
 
 class RequestAdditionalInfo(BaseModel):
@@ -163,7 +195,9 @@ class RequestAdditionalInfo(BaseModel):
         description="Specific list of required information"
     )
     reason: str = Field(max_length=500)
-    duration_minutes: int = _DURATION
+    typical_duration_minutes: int = _TYPICAL
+    complexity_rationale: str = _RATIONALE
+    case_complexity: int = _COMPLEXITY
 
 
 class EscalateCase(BaseModel):
@@ -179,7 +213,9 @@ class EscalateCase(BaseModel):
         description="'approve' | 'reject' | 'conditional'",
         pattern="^(approve|reject|conditional)$",
     )
-    duration_minutes: int = _DURATION
+    typical_duration_minutes: int = _TYPICAL
+    complexity_rationale: str = _RATIONALE
+    case_complexity: int = _COMPLEXITY
 
 
 # -- Credit Officer tools -----------------------
@@ -198,7 +234,9 @@ class AssessRisk(BaseModel):
         description="Specific risk factors identified"
     )
     assessment_notes: str = Field(max_length=800)
-    duration_minutes: int = _DURATION
+    typical_duration_minutes: int = _TYPICAL
+    complexity_rationale: str = _RATIONALE
+    case_complexity: int = _COMPLEXITY
 
 
 class ApproveLoan(BaseModel):
@@ -216,7 +254,9 @@ class ApproveLoan(BaseModel):
         description="Additional approval conditions",
     )
     approval_notes: str = Field(default="", max_length=500)
-    duration_minutes: int = _DURATION
+    typical_duration_minutes: int = _TYPICAL
+    complexity_rationale: str = _RATIONALE
+    case_complexity: int = _COMPLEXITY
 
 
 class RejectLoan(BaseModel):
@@ -229,7 +269,9 @@ class RejectLoan(BaseModel):
         description="At least one formal rejection reason",
     )
     rejection_notes: str = Field(max_length=500)
-    duration_minutes: int = _DURATION
+    typical_duration_minutes: int = _TYPICAL
+    complexity_rationale: str = _RATIONALE
+    case_complexity: int = _COMPLEXITY
 
 
 # -- Tool registry per agent role ---------------

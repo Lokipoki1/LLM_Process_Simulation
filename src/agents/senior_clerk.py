@@ -8,11 +8,9 @@ from __future__ import annotations
 from ..tools.schemas import (
     CheckCreditScore, ValidateApplication, RequestAdditionalInfo, EscalateCase,
 )
-from ..tools.duration_reference import duration_prompt_block
+from ..tools.duration_reference import complexity_prompt_block
 from ..state import ProcessState
 from .base_agent import BaseAgent
-
-_TOOLS = [CheckCreditScore, ValidateApplication, RequestAdditionalInfo, EscalateCase]
 
 SYSTEM_PROMPT = """
 You are Ana, a Senior Clerk with 5 years of experience in credit analysis
@@ -70,7 +68,7 @@ MUST call CheckCreditScore first.
   2. EscalateCase - after one rework round, always escalate. Mention the
      exchange in your risk_summary: "After requesting clarification on X,
      Carlos confirmed Y, which changes/confirms my initial assessment."
-""" + duration_prompt_block([t.__name__ for t in _TOOLS]) + """
+""" + complexity_prompt_block() + """
 Execute ONE tool per turn.
 """
 
@@ -78,7 +76,9 @@ Execute ONE tool per turn.
 class SeniorClerk(BaseAgent):
     name = "senior_clerk"
     system_prompt = SYSTEM_PROMPT
-    tool_schemas = _TOOLS
+    tool_schemas = [
+        CheckCreditScore, ValidateApplication, RequestAdditionalInfo, EscalateCase,
+    ]
 
     def _resolve_next_agent(self, tool_name, tool_args, state):
         if tool_name == "EscalateCase":

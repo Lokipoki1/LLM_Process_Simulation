@@ -8,11 +8,9 @@ from __future__ import annotations
 from ..tools.schemas import (
     IntakeApplication, CheckDocuments, ForwardCase, ReturnApplicationEarly,
 )
-from ..tools.duration_reference import duration_prompt_block
+from ..tools.duration_reference import complexity_prompt_block
 from ..state import ProcessState
 from .base_agent import BaseAgent
-
-_TOOLS = [IntakeApplication, CheckDocuments, ForwardCase, ReturnApplicationEarly]
 
 SYSTEM_PROMPT = """
 You are Carlos, a Junior Clerk with 2 years of experience at a European
@@ -23,7 +21,6 @@ YOU CAN ONLY SEE the application form:
   - Requested amount
   - Loan goal (car, home improvement, existing loan takeover, etc.)
   - Application type (new credit, limit raise, etc.)
-  - Whether the file arrived with complete documentation
 You do NOT have access to credit scores or income data.
 
 === WHEN YOU RECEIVE A NEW CASE ===
@@ -31,9 +28,8 @@ You do NOT have access to credit scores or income data.
   1. IntakeApplication - register receipt. Write your first impressions:
      does the amount make sense for the stated goal? Anything unusual?
 
-  2. CheckDocuments - verify the documentation. If the case context says
-     the file arrived incomplete, say exactly what is missing and set
-     document_status accordingly. Do not wave an incomplete file through.
+  2. CheckDocuments - verify the documentation. Be specific about what
+     you checked and what you found.
 
   3. Decide:
      - ForwardCase if documentation is acceptable and the request seems
@@ -56,12 +52,13 @@ You do NOT have access to credit scores or income data.
   - if she questioned an inconsistency, address that exact point
 
   Think of it as replying to a colleague's email: answer what was asked
-  instead of repeating a generic document check.
+  instead of repeating a generic document check. A reworked file is
+  rarely an ordinary one - it already cost someone a question.
 
   Then:
   1. CheckDocuments with findings that answer her question
   2. ForwardCase back to Ana
-""" + duration_prompt_block([t.__name__ for t in _TOOLS]) + """
+""" + complexity_prompt_block() + """
 Execute ONE tool per turn.
 """
 
@@ -69,7 +66,9 @@ Execute ONE tool per turn.
 class JuniorClerk(BaseAgent):
     name = "junior_clerk"
     system_prompt = SYSTEM_PROMPT
-    tool_schemas = _TOOLS
+    tool_schemas = [
+        IntakeApplication, CheckDocuments, ForwardCase, ReturnApplicationEarly,
+    ]
 
     def _resolve_next_agent(self, tool_name, tool_args, state):
         if tool_name == "ForwardCase":

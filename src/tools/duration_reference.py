@@ -1,128 +1,151 @@
 """
 duration_reference.py
 ---------------------
-Reference durations per activity, injected into each agent's system
-prompt so their estimates land on a realistic scale.
+Reference durations per activity, and the complexity scale that agents
+use to place a specific case against them.
 
-Why this exists
-    Uncalibrated, gpt-4o-mini estimates 5 minutes for a credit bureau
-    query and 10 minutes for a rework request. Measured against the
-    BPIC-fitted distributions that is an underestimate of 10x to 16x,
-    and the consequence is not just wrong timestamps: with every step
-    taking 5-30 minutes the workers never saturate, no queue forms, no
-    activity crosses the end of a shift, and every case closes the same
-    day. The queueing dynamics the engine exists to model disappear.
+Why this split exists
+---------------------
+Two earlier configurations both failed, in opposite directions:
 
-    Giving the agent a reference range restores the scale while leaving
-    the judgement with the agent: it still decides whether THIS case sits
-    below, inside, or above the typical band.
+  Uncalibrated absolute estimates
+      gpt-4o-mini answered 5 minutes for a credit bureau query and 10
+      for a rework request: 10x to 16x below the fitted distributions.
+      With every step taking 5-30 minutes the workers never saturate,
+      no queue forms, nothing crosses a shift boundary, and every case
+      closes the same day. The queueing dynamics the engine exists to
+      model disappear.
 
-Calibration source
-    The anchors below are the medians and interquartile-style bands of
-    the log-normal parameters in clock/simulation_clock.py. Once the
-    activity-label mapping to BPIC 2017 is settled, regenerate them from
-    the real log with extract_bpic_distributions() and replace this table
-    (see build_reference_from_distributions).
+  Anchored absolute estimates
+      Given a reference band, the model copied the typical figure
+      verbatim. Eight of ten tools came back with zero variance and a
+      ratio of exactly 1.00 against their anchor. The scale was right
+      and the agent contributed nothing beyond the anchor.
+
+The reading of those two results is that the model is poor at absolute
+temporal magnitude, but is being asked the wrong question. Judging
+whether a file is straightforward or messy is a reading task, which is
+what it is good at. So the question is split:
+
+  the AGENT   judges how complex this case was, on a 1-5 scale
+  the ENGINE  turns that judgement into minutes, against an anchor
+              derived from the reference log
+
+Variance now comes from the agent's reading of each case rather than
+from its arithmetic, and the scale is guaranteed by construction.
+
+Agents are ALSO asked for a free, unanchored estimate of how long the
+task usually takes. That number never advances the clock - it is
+recorded so the two abilities can be reported separately: calibration in
+absolute magnitude, and discrimination of relative complexity.
 """
 
 from __future__ import annotations
 
-# tool_name -> (typical_minutes, low_minutes, high_minutes)
-DURATION_REFERENCE: dict[str, tuple[int, int, int]] = {
+# tool_name -> typical hands-on minutes for an ordinary case.
+# Medians of the log-normal parameters in clock/simulation_clock.py.
+# Regenerate from the reference log with build_anchors_from_distributions()
+# once the activity-label mapping is settled.
+DURATION_ANCHOR: dict[str, int] = {
     # Junior Clerk
-    "IntakeApplication":      (30, 15, 60),
-    "CheckDocuments":         (40, 20, 80),
-    "ForwardCase":            (8, 5, 15),
-    "ReturnApplicationEarly": (7, 5, 15),
+    "IntakeApplication":      30,
+    "CheckDocuments":         40,
+    "ForwardCase":             8,
+    "ReturnApplicationEarly":  7,
 
     # Senior Clerk
-    "CheckCreditScore":       (50, 25, 100),
-    "ValidateApplication":    (80, 40, 160),
-    "RequestAdditionalInfo":  (165, 60, 300),
-    "EscalateCase":           (11, 6, 20),
+    "CheckCreditScore":       50,
+    "ValidateApplication":    80,
+    "RequestAdditionalInfo": 165,
+    "EscalateCase":           11,
 
     # Credit Officer
-    "AssessRisk":             (135, 60, 260),
-    "ApproveLoan":            (22, 12, 45),
-    "RejectLoan":             (18, 10, 35),
+    "AssessRisk":            135,
+    "ApproveLoan":            22,
+    "RejectLoan":             18,
 }
 
 
-def format_reference(tool_names: list[str]) -> str:
+# Complexity rating -> multiplier applied to the anchor.
+# 3 is the ordinary case; the extremes span roughly a threefold range,
+# which is the spread the fitted distributions show between their 10th
+# and 90th percentiles.
+COMPLEXITY_MULTIPLIER: dict[int, float] = {
+    1: 0.7,   # unusually clean, nothing to check twice
+    2: 1.0,   # straightforward
+    3: 1.3,   # ordinary
+    4: 1.8,   # awkward: something did not line up
+    5: 2.5,   # difficult: conflicting signals, had to work for it
+}
+
+COMPLEXITY_SCALE_TEXT = """\
+    1  unusually clean - everything lined up, nothing to check twice
+    2  straightforward - ordinary file, no surprises
+    3  ordinary - the usual amount of work for this task
+    4  awkward - something did not line up and cost you extra effort
+    5  difficult - conflicting signals, or you had to dig for an answer"""
+
+
+def resolve_minutes(tool_name: str, complexity: int) -> float | None:
     """
-    Render the reference band for a set of tools as a prompt fragment.
-
-    Only the tools the agent actually owns are included, so each persona
-    sees its own workload and nothing else.
+    Convert a complexity rating into hands-on minutes for a tool.
+    Returns None when the tool has no anchor, so the caller can fall back.
     """
-    lines = []
-    for name in tool_names:
-        ref = DURATION_REFERENCE.get(name)
-        if not ref:
-            continue
-        typical, low, high = ref
-        lines.append(f"    {name}: typically {typical} min (usual range {low}-{high})")
-    return "\n".join(lines)
+    anchor = DURATION_ANCHOR.get(tool_name)
+    if anchor is None:
+        return None
+    multiplier = COMPLEXITY_MULTIPLIER.get(int(complexity), 1.0)
+    return anchor * multiplier
 
 
-def duration_prompt_block(tool_names: list[str]) -> str:
+def complexity_prompt_block() -> str:
     """
-    The full duration-estimation section for an agent's system prompt.
+    The duration section of an agent's system prompt.
 
-    The reference is framed as departmental experience rather than as an
-    instruction to copy: the agent is told what these tasks usually take
-    and asked to place THIS case against that baseline.
+    Deliberately contains NO reference durations. The agent is asked for
+    a free estimate of the typical time - recorded but never used to
+    advance the clock - and for a complexity judgement, which is.
+    Withholding the anchor is what keeps the free estimate usable as
+    evidence about the model's unaided calibration.
     """
     return f"""
-=== ESTIMATING DURATION ===
+=== TIME AND COMPLEXITY ===
 
-Every tool asks for duration_minutes: the hands-on working minutes this
-activity took you for THIS case. Count only time with the file actually
-open in front of you. Queueing, overnight gaps and weekends are added by
-the system separately, so never include them.
+Every tool asks you two things about the work you just did.
 
-From your years in this department, these are the times these tasks
-usually take:
+typical_duration_minutes
+    From your experience, how long does this kind of task take on an
+    ORDINARY case? Not this case in particular - the usual one. Count
+    only hands-on working minutes: time with the file actually open.
+    Queueing, overnight gaps and weekends are handled elsewhere.
 
-{format_reference(tool_names)}
+complexity_rationale, then case_complexity
+    First write, in one sentence, what made THIS case easy or hard.
+    Then rate it:
 
-Those are baselines, not targets. Place this case against them:
-  - a clean, small, routine file lands below the typical figure
-  - an unusual amount, a vague loan goal, contradictory numbers, or a
-    file you had to re-open after rework lands above it
-  - a genuinely difficult case can exceed the usual range
+{COMPLEXITY_SCALE_TEXT}
 
-Report the number this case actually cost you. Two different cases should
-rarely take exactly the same time.
+    Rate the file in front of you, not the task in general. Most cases
+    are a 3. Reserve 1 and 5 for files that genuinely stand out, and be
+    willing to use them when they do - a rating that never moves off 3
+    is not a judgement.
 """
 
 
-def build_reference_from_distributions(
+def build_anchors_from_distributions(
     distributions: dict[str, tuple[float, float]],
-) -> dict[str, tuple[int, int, int]]:
+) -> dict[str, int]:
     """
-    Rebuild the reference table from fitted log-normal parameters.
-
-    For a log-normal with parameters (mu, sigma):
-        median = exp(mu)
-        low    = exp(mu - 0.675 * sigma)   ~ 25th percentile
-        high   = exp(mu + 0.675 * sigma)   ~ 75th percentile
+    Rebuild the anchor table from fitted log-normal parameters.
+    For parameters (mu, sigma) in seconds, the anchor is exp(mu) / 60.
 
     Args:
-        distributions: {tool_name: (mu, sigma)} in seconds, as produced
-                       by extract_bpic_distributions()
-
-    Returns:
-        {tool_name: (typical_min, low_min, high_min)}
+        distributions: {tool_name: (mu, sigma)}, as produced by
+                       extract_bpic_distributions()
     """
     import math
-
-    out: dict[str, tuple[int, int, int]] = {}
-    for name, (mu, sigma) in distributions.items():
-        if name.startswith("_"):
-            continue
-        median = math.exp(mu) / 60
-        low = math.exp(mu - 0.675 * sigma) / 60
-        high = math.exp(mu + 0.675 * sigma) / 60
-        out[name] = (max(1, round(median)), max(1, round(low)), max(1, round(high)))
-    return out
+    return {
+        name: max(1, round(math.exp(mu) / 60))
+        for name, (mu, _sigma) in distributions.items()
+        if not name.startswith("_")
+    }

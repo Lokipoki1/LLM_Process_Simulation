@@ -33,7 +33,6 @@ from dotenv import load_dotenv
 from src.queue.simulation_engine import SimulationEngine, EngineConfig
 from src.clock.simulation_clock import SimulationClock
 from src.process.loan_application import LOAN_PROCESS
-from src.process.loan_application_rules import LOAN_PROCESS_RULES
 from src.simulation_controller import generate_synthetic_case, load_bpic_cases
 from src.logger import setup_logging
 
@@ -66,14 +65,6 @@ def parse_args():
         "--noise", type=float, default=0.0,
         help="Lognormal noise on work time as a coefficient of variation (0 = off)",
     )
-    p.add_argument(
-        "--agents", type=str, default="llm", choices=["llm", "rules"],
-        help=(
-            "Which agents decide. llm: the LLM personas. "
-            "rules: deterministic baseline with identical tools and routing, "
-            "for measuring what the LLM contributes. (default: llm)"
-        ),
-    )
     p.add_argument("--verbose", action="store_true",          help="Print debug logs to console")
     return p.parse_args()
 
@@ -97,11 +88,6 @@ def main():
         ]
         print(f"  Generated {len(cases)} synthetic cases (seed={args.seed})")
 
-    duration_source = args.durations
-    if args.agents == "rules" and duration_source == "llm":
-        print("  [note] --agents rules has no free-text estimate; using complexity")
-        duration_source = "complexity"
-
     config = EngineConfig(
         workforce={
             "junior_clerk":   args.jc,
@@ -109,7 +95,7 @@ def main():
             "credit_officer": args.co,
         },
         mean_interarrival_s=args.arrival * 60,
-        duration_source=duration_source,
+        duration_source=args.durations,
         duration_noise_cv=args.noise,
         model=model,
         ollama_base_url=base_url,
@@ -119,7 +105,7 @@ def main():
 
     engine = SimulationEngine(
         cases=cases,
-        process=LOAN_PROCESS_RULES if args.agents == "rules" else LOAN_PROCESS,
+        process=LOAN_PROCESS,
         config=config,
         clock=clock,
         output_dir=args.output,

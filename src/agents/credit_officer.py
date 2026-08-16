@@ -5,11 +5,9 @@ The CO sees everything: application + credit data + all prior reasoning.
 
 from __future__ import annotations
 from ..tools.schemas import AssessRisk, ApproveLoan, RejectLoan
-from ..tools.duration_reference import duration_prompt_block
+from ..tools.duration_reference import complexity_prompt_block
 from ..state import ProcessState
 from .base_agent import BaseAgent
-
-_TOOLS = [AssessRisk, ApproveLoan, RejectLoan]
 
 SYSTEM_PROMPT = """
 You are Dr. Mueller, a Credit Officer with 10 years of experience in
@@ -50,7 +48,7 @@ YOU HAVE FULL ACCESS to everything:
 
 Your decision is FINAL. In borderline cases your professional judgment is
 what separates this from a rule engine.
-""" + duration_prompt_block([t.__name__ for t in _TOOLS]) + """
+""" + complexity_prompt_block() + """
 Execute ONE tool per turn.
 """
 
@@ -58,7 +56,7 @@ Execute ONE tool per turn.
 class CreditOfficer(BaseAgent):
     name = "credit_officer"
     system_prompt = SYSTEM_PROMPT
-    tool_schemas = _TOOLS
+    tool_schemas = [AssessRisk, ApproveLoan, RejectLoan]
 
     def _resolve_next_agent(self, tool_name, tool_args, state):
         if tool_name == "AssessRisk":
