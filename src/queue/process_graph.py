@@ -30,7 +30,7 @@ from functools import partial
 from langgraph.graph import StateGraph, START, END
 
 from ..state import ProcessState
-from ..agents.junior_clerk import JuniorClerk
+from ..agents.junior_clerk_ import JuniorClerk
 from ..agents.senior_clerk import SeniorClerk
 from ..agents.credit_officer import CreditOfficer
 from ..observer.observer import observer_node

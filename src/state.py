@@ -86,6 +86,7 @@ class AgentAction(TypedDict):
 class XESEntry(TypedDict):
     case_concept_name: str
     concept_name: str
+    start_timestamp: str
     time_timestamp: str
     org_resource: str
     lifecycle_transition: str

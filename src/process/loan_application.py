@@ -67,26 +67,42 @@ def make_loan_state(case_data: dict) -> ProcessState:
 # -------------------------------------------------
 # Activity vocabulary
 # -------------------------------------------------
-# tool name -> XES activity label.
+# tool name -> XES activity label, using BPIC 2017's own vocabulary so
+# the synthetic log and the reference log share an alphabet. Without
+# that, any label-based distance (n-gram, directly-follows) compares
+# disjoint sets and reports maximum distance regardless of how faithful
+# the simulation is.
 #
-# The labels below are the framework's own vocabulary. To compute NGD or
-# a directly-follows comparison against BPIC 2017, these need to be
-# aligned with the reference log's labels - that alignment is a research
-# decision, not an implementation detail, so it is left explicit here
-# rather than hidden in the observer.
+# The labels were inherited from BPIC 2012 (A_INTAKE, O_APPROVED, ...)
+# and never updated when the project moved datasets. These are the
+# BPIC 2017 equivalents.
+#
+# Reading the BPIC 2017 prefixes:
+#   A_  the state of the APPLICATION, as the bank sees it
+#   O_  the state of the OFFER, driven by what the CUSTOMER does with it
+#   W_  work items: what an employee actually performs
+#
+# The simulation has no customer actor, so no tool maps to an O_ label:
+# the Credit Officer decides whether the BANK lends, which is A_Pending
+# or A_Denied, not the customer accepting or refusing an offer.
 
 ACTIVITY_MAP: dict[str, str] = {
-    "IntakeApplication":      "A_INTAKE",
-    "CheckDocuments":         "A_CHECK_DOCS",
-    "ForwardCase":            "A_FORWARD",
-    "ReturnApplicationEarly": "O_RETURNED",
-    "CheckCreditScore":       "W_CHECK_CREDIT",
-    "ValidateApplication":    "A_VALIDATE",
-    "RequestAdditionalInfo":  "A_REQUEST_INFO",
-    "EscalateCase":           "A_ESCALATE",
-    "AssessRisk":             "A_ASSESS_RISK",
-    "ApproveLoan":            "O_APPROVED",
-    "RejectLoan":             "O_DECLINED",
+    # Junior Clerk
+    "IntakeApplication":      "A_Create Application",
+    "CheckDocuments":         "W_Complete application",
+    "ForwardCase":            "_HANDOVER_TO_SENIOR",       # silent
+    "ReturnApplicationEarly": "A_Cancelled",
+
+    # Senior Clerk
+    "CheckCreditScore":       "_CREDIT_BUREAU_LOOKUP",     # silent
+    "ValidateApplication":    "W_Validate application",
+    "RequestAdditionalInfo":  "W_Call incomplete files",
+    "EscalateCase":           "_HANDOVER_TO_OFFICER",      # silent
+
+    # Credit Officer
+    "AssessRisk":             "A_Validating",
+    "ApproveLoan":            "A_Pending",
+    "RejectLoan":             "A_Denied",
 }
 
 RESOURCE_MAP: dict[str, str] = {
@@ -99,20 +115,28 @@ RESOURCE_MAP: dict[str, str] = {
 # -------------------------------------------------
 # Silent tools
 # -------------------------------------------------
-# Tools that move the case without producing a log event.
+# Tools that advance the case without producing a log event.
 #
-# ForwardCase and EscalateCase are internal handovers: they change who
-# holds the file, but a bank's information system records activities, not
-# handoffs. AssessRisk is deliberation rather than a recorded step.
-# Emitting all three lengthens every trace by two to three events
-# relative to the reference log, which inflates any label-based distance.
+# ForwardCase and EscalateCase are internal handovers. They change who
+# holds the file, but a bank's information system records activities,
+# not handoffs - there is no BPIC 2017 activity for "the junior clerk
+# passed this to the senior clerk".
 #
-# Left empty for now so the current results stay comparable with earlier
-# runs. Enable by replacing the empty frozenset with the commented one,
-# then re-run and compare trace lengths against BPIC 2017.
+# CheckCreditScore is information gathering. The credit score does exist
+# in BPIC 2017, but as an ATTRIBUTE of O_Create Offer, and offer
+# creation happens after the bank has decided to lend - later in the
+# process than the point where the Senior Clerk looks the score up.
+# Mapping it to O_Create Offer would put that activity before
+# validation, inverting the real order.
+#
+# Emitting all three inflates every trace by three events relative to
+# the reference log, which distorts trace-length and n-gram comparisons.
 
-SILENT_TOOLS: frozenset[str] = frozenset()
-# SILENT_TOOLS = frozenset({"ForwardCase", "EscalateCase", "AssessRisk"})
+SILENT_TOOLS: frozenset[str] = frozenset({
+    "ForwardCase",
+    "EscalateCase",
+    "CheckCreditScore",
+})
 
 
 # -------------------------------------------------
@@ -156,3 +180,63 @@ LOAN_PROCESS = ProcessDefinition(
         "credit_officer": WorkSchedule(9.0, 17.0),
     },
 )
+
+
+# -------------------------------------------------
+# Reference: the full BPIC 2017 vocabulary
+# -------------------------------------------------
+# All 26 activities in the log, for checking coverage and for deciding
+# what a future, finer-grained instantiation might model. The simulation
+# currently produces 7 of these; the rest belong to steps it abstracts
+# away (lead handling, offer dispatch, customer response, fraud checks,
+# collection).
+
+BPIC_2017_ACTIVITIES: frozenset[str] = frozenset({
+    # Application state
+    "A_Create Application", "A_Submitted", "A_Concept", "A_Accepted",
+    "A_Complete", "A_Validating", "A_Incomplete", "A_Pending",
+    "A_Denied", "A_Cancelled",
+    # Offer state (customer-driven; the simulation has no customer actor)
+    "O_Create Offer", "O_Created", "O_Sent (mail and online)",
+    "O_Sent (online only)", "O_Returned", "O_Accepted", "O_Refused",
+    "O_Cancelled",
+    # Work items
+    "W_Handle leads", "W_Complete application", "W_Call after offers",
+    "W_Validate application", "W_Call incomplete files",
+    "W_Assess potential fraud", "W_Shortened completion",
+    "W_Personal Loan collection",
+})
+
+
+def check_mapping_coverage() -> dict:
+    """
+    Which emitted labels exist in the reference log, and which do not.
+
+    Run this after changing ACTIVITY_MAP. Any label reported as unknown
+    will have no counterpart in the reference log and will contribute
+    maximum distance to every label-based metric.
+    """
+    emitted = {
+        label for tool, label in ACTIVITY_MAP.items()
+        if tool not in SILENT_TOOLS
+    }
+    return {
+        "emitted": sorted(emitted),
+        "valid": sorted(emitted & BPIC_2017_ACTIVITIES),
+        "unknown": sorted(emitted - BPIC_2017_ACTIVITIES),
+        "unused_in_log": sorted(BPIC_2017_ACTIVITIES - emitted),
+    }
+
+
+if __name__ == "__main__":
+    result = check_mapping_coverage()
+    print(f"Emitted labels: {len(result['emitted'])}")
+    for label in result["emitted"]:
+        mark = "ok " if label in BPIC_2017_ACTIVITIES else "NOT IN LOG"
+        print(f"  {mark:<11}{label}")
+    if result["unknown"]:
+        print(f"\nNot present in BPIC 2017: {result['unknown']}")
+    else:
+        print("\nEvery emitted label exists in BPIC 2017.")
+    print(f"\nLog activities the simulation does not produce: "
+          f"{len(result['unused_in_log'])}")

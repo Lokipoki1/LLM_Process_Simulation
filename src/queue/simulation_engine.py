@@ -361,6 +361,7 @@ class SimulationEngine:
                     last_action,
                     self.process.activity_map,
                     self.process.resource_map,
+                    start_timestamp=dispatch_time,
                 ))
                 self._global_event_log.append(xes_entry)
                 state = merge_state(state, {"event_log": [xes_entry]})
@@ -656,13 +657,14 @@ class SimulationEngine:
         df = pd.DataFrame(self._global_event_log).rename(columns={
             "case_concept_name":    "case:concept:name",
             "concept_name":         "concept:name",
+            "start_timestamp":      "start_timestamp",
             "time_timestamp":       "time:timestamp",
             "org_resource":         "org:resource",
             "lifecycle_transition": "lifecycle:transition",
         })
-        df["time:timestamp"] = pd.to_datetime(
-            df["time:timestamp"], format="ISO8601", utc=True,
-        )
+        for col in ("start_timestamp", "time:timestamp"):
+            df[col] = pd.to_datetime(df[col], format="ISO8601", utc=True)
+            
         df = df.sort_values(["case:concept:name", "time:timestamp"])
 
         out = self.output_dir / filename
