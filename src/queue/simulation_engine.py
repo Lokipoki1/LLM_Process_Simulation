@@ -77,7 +77,15 @@ class EngineConfig:
     # role -> WorkSchedule override. Falls back to the definition.
     schedules: dict[str, WorkSchedule] = field(default_factory=dict)
 
-    # Case arrivals
+    # Case arrivals.
+    #   "replay"    use each case's real arrival_time, when present.
+    #               Removes the arrival model as a confound: absolute-time
+    #               measures then reflect what the engine did with the
+    #               same demand the real system faced.
+    #   "synthetic" generate a Poisson process at mean_interarrival_s.
+    #               Only this mode makes the case-arrival measure a test
+    #               of anything.
+    arrival_mode: str = "replay"
     mean_interarrival_s: float = 3600.0
 
     # Office hours used to snap arrivals to plausible submission times
@@ -97,7 +105,7 @@ class EngineConfig:
 
     # Safety limits
     max_steps_per_case: int = 20
-    max_events: int = 10000
+    max_events: int = 10_000
 
     # LLM
     model: str = "gpt-4o-mini"
@@ -223,6 +231,78 @@ class SimulationEngine:
     # -- Case arrivals -------------------------
 
     def _schedule_arrivals(self, rng: np.random.Generator):
+        """
+        Put every case on the event queue at its arrival time.
+
+        In "replay" mode each case's recorded arrival_time is used
+        verbatim, so the simulator faces the same demand, in the same
+        order, at the same moments as the real system. Nothing is
+        snapped to office hours - the real log already reflects whatever
+        submission pattern existed, including out-of-hours applications.
+
+        In "synthetic" mode arrivals are drawn from a Poisson process
+        and snapped into the submission window, which is the only option
+        available for generated cases.
+        """
+        replay = self.config.arrival_mode == "replay"
+        have_times = sum(1 for c in self.cases if c.get("arrival_time"))
+
+        if replay and have_times == 0:
+            logger.warning(
+                "arrival_mode='replay' but no case carries an arrival_time - "
+                "falling back to a synthetic Poisson process"
+            )
+            replay = False
+        elif replay and have_times < len(self.cases):
+            logger.warning(
+                "%d of %d cases lack an arrival_time; those are placed after "
+                "the last known arrival",
+                len(self.cases) - have_times, len(self.cases),
+            )
+
+        if replay:
+            self._schedule_replayed_arrivals()
+        else:
+            self._schedule_synthetic_arrivals(rng)
+
+    def _schedule_replayed_arrivals(self):
+        """Use the real arrival timestamps, in their real order."""
+        timed = sorted(
+            (c for c in self.cases if c.get("arrival_time")),
+            key=lambda c: c["arrival_time"],
+        )
+        untimed = [c for c in self.cases if not c.get("arrival_time")]
+
+        # Start the simulation clock at the first real arrival, so the
+        # exported timestamps sit on the reference log's own timeline
+        # and need no post-hoc shifting.
+        if timed:
+            self._clock._current = timed[0]["arrival_time"]
+
+        for case in timed:
+            self._event_queue.schedule_arrival(
+                time=case["arrival_time"],
+                case_id=case["case_id"],
+                case_data=dict(case),
+            )
+
+        t = timed[-1]["arrival_time"] if timed else self._clock.current
+        for case in untimed:
+            t += self.config.mean_interarrival_s
+            self._event_queue.schedule_arrival(
+                time=t, case_id=case["case_id"], case_data=dict(case),
+            )
+
+        if timed:
+            first = datetime.fromtimestamp(timed[0]["arrival_time"], tz=timezone.utc)
+            last = datetime.fromtimestamp(timed[-1]["arrival_time"], tz=timezone.utc)
+            logger.info(
+                "Replaying %d real arrivals, %s to %s (%d days)",
+                len(timed), first.strftime("%Y-%m-%d"),
+                last.strftime("%Y-%m-%d"), (last - first).days,
+            )
+
+    def _schedule_synthetic_arrivals(self, rng: np.random.Generator):
         """Poisson arrivals, snapped into the submission window."""
         window = self.config.arrival_window
         current_time = self._clock.current
@@ -242,13 +322,11 @@ class SimulationEngine:
                 case_id=case["case_id"],
                 case_data=dict(case),
             )
-            logger.debug(
-                "Scheduled %s arrival at %s",
-                case["case_id"],
-                datetime.fromtimestamp(current_time, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
-            )
 
-    # -- Duration resolution -------------------
+        logger.info(
+            "Generated %d synthetic arrivals (mean gap %.0f min)",
+            len(self.cases), self.config.mean_interarrival_s / 60,
+        )
 
     def _resolve_work_seconds(
         self, tool_name: str | None, tool_output: dict
@@ -361,7 +439,6 @@ class SimulationEngine:
                     last_action,
                     self.process.activity_map,
                     self.process.resource_map,
-                    start_timestamp=dispatch_time,
                 ))
                 self._global_event_log.append(xes_entry)
                 state = merge_state(state, {"event_log": [xes_entry]})
@@ -525,7 +602,11 @@ class SimulationEngine:
         print(f"  Process: {self.process.name}")
         print(f"  Model: {self.config.model}")
         print(f"  Cases: {len(self.cases)} | Workforce: {workforce}")
-        print(f"  Mean inter-arrival: {self.config.mean_interarrival_s / 60:.0f} min")
+        if self.config.arrival_mode == "replay":
+            print("  Arrivals: replayed from the reference log")
+        else:
+            print(f"  Arrivals: synthetic, mean gap "
+                  f"{self.config.mean_interarrival_s / 60:.0f} min")
         print(f"  Duration source: {self.config.duration_source}")
         if self.process.silent_tools:
             print(f"  Silent tools: {', '.join(sorted(self.process.silent_tools))}")
@@ -657,14 +738,13 @@ class SimulationEngine:
         df = pd.DataFrame(self._global_event_log).rename(columns={
             "case_concept_name":    "case:concept:name",
             "concept_name":         "concept:name",
-            "start_timestamp":      "start_timestamp",
             "time_timestamp":       "time:timestamp",
             "org_resource":         "org:resource",
             "lifecycle_transition": "lifecycle:transition",
         })
-        for col in ("start_timestamp", "time:timestamp"):
-            df[col] = pd.to_datetime(df[col], format="ISO8601", utc=True)
-            
+        df["time:timestamp"] = pd.to_datetime(
+            df["time:timestamp"], format="ISO8601", utc=True,
+        )
         df = df.sort_values(["case:concept:name", "time:timestamp"])
 
         out = self.output_dir / filename

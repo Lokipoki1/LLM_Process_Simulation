@@ -43,6 +43,8 @@ load_dotenv()
 def parse_args():
     p = argparse.ArgumentParser(description="Multi-LLM-Agent BPS - DES Engine")
     p.add_argument("--cases",   type=int,   default=20,       help="Number of cases to simulate")
+    p.add_argument("--offset",  type=int,   default=0,
+                   help="Skip this many cases (in arrival order) before taking the block")
     p.add_argument("--bpic",    type=str,   default=None,     help="Path to BPIC XES file")
     p.add_argument("--model",   type=str,   default=None,     help="LLM model name")
     p.add_argument("--seed",    type=int,   default=42,       help="Random seed")
@@ -50,7 +52,18 @@ def parse_args():
     p.add_argument("--jc",      type=int,   default=2,        help="Number of Junior Clerks")
     p.add_argument("--sc",      type=int,   default=1,        help="Number of Senior Clerks")
     p.add_argument("--co",      type=int,   default=1,        help="Number of Credit Officers")
-    p.add_argument("--arrival", type=float, default=60.0,     help="Mean inter-arrival time (minutes)")
+    p.add_argument("--arrival", type=float, default=60.0,
+                   help="Mean inter-arrival time in minutes (synthetic arrivals only)")
+    p.add_argument(
+        "--arrivals", type=str, default="replay",
+        choices=["replay", "synthetic"],
+        help=(
+            "replay: feed cases at their real BPIC arrival times, in real "
+            "order, so absolute-time measures reflect the engine rather than "
+            "an invented demand pattern. synthetic: Poisson process at "
+            "--arrival. (default: replay)"
+        ),
+    )
     p.add_argument(
         "--durations", type=str, default="complexity",
         choices=["complexity", "llm", "distribution"],
@@ -87,7 +100,7 @@ def main():
 
     # Cases
     if args.bpic:
-        cases = load_bpic_cases(args.bpic, max_cases=args.cases)
+        cases = load_bpic_cases(args.bpic, max_cases=args.cases, offset=args.offset)
         print(f"  Loaded {len(cases)} cases from BPIC")
     else:
         rng = np.random.default_rng(args.seed)
@@ -108,6 +121,7 @@ def main():
             "senior_clerk":   args.sc,
             "credit_officer": args.co,
         },
+        arrival_mode=args.arrivals,
         mean_interarrival_s=args.arrival * 60,
         duration_source=duration_source,
         duration_noise_cv=args.noise,
