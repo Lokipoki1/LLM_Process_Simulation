@@ -107,10 +107,37 @@ class EngineConfig:
     max_steps_per_case: int = 20
     max_events: int = 10_000
 
+    # Write a checkpoint every N completed cases. A run of a few hundred
+    # cases is half an hour of LLM calls; losing it to a dropped
+    # connection or a closed terminal costs real money and time. The
+    # checkpoint holds every event produced so far, so a killed run can
+    # still be evaluated on the cases that did finish.
+    # Set to 0 to disable.
+    checkpoint_every: int = 10
+
     # LLM
     model: str = "gpt-4o-mini"
     ollama_base_url: str = "http://localhost:11434"
     temperature: float = 0.3
+
+    # Seconds to wait for one LLM call before giving up on it.
+    # Without an explicit value the client waits ten minutes and then
+    # retries twice, which looks like a frozen process. A stalled call
+    # is almost always a dead socket - Windows suspends the network
+    # adapter to save power when the window loses focus, and the TCP
+    # connection dies silently - so failing fast and retrying is both
+    # quicker and more likely to succeed than waiting.
+    llm_timeout_s: float = 90.0
+
+    # Retries inside the client, for transient HTTP failures.
+    llm_max_retries: int = 2
+
+    # Retries at the engine level, around the whole step. Covers the
+    # case where every client retry also times out. A step that still
+    # fails after this is recorded as an error rather than silently
+    # turning the case into a rejection.
+    step_max_retries: int = 2
+    step_retry_wait_s: float = 5.0
 
 
 # -------------------------------------------------
@@ -183,6 +210,7 @@ class SimulationEngine:
         self._scheduled_shifts: set[str] = set()
         self._last_printed = 0
         self._duration_fallbacks = 0
+        self._failed_cases: list[str] = []
         self._duration_samples: list[dict] = []
         self._noise_rng = np.random.default_rng(20250729)
 
@@ -191,16 +219,31 @@ class SimulationEngine:
     # -- Setup ---------------------------------
 
     def _build_llm(self):
+        """Instantiate the LLM with an explicit timeout."""
         model = self.config.model
         if model.startswith("gpt-"):
             from langchain_openai import ChatOpenAI
-            return ChatOpenAI(model=model, temperature=self.config.temperature)
+            return ChatOpenAI(
+                model=model,
+                temperature=self.config.temperature,
+                timeout=self.config.llm_timeout_s,
+                max_retries=self.config.llm_max_retries,
+            )
         from langchain_ollama import ChatOllama
-        return ChatOllama(
-            model=model,
-            base_url=self.config.ollama_base_url,
-            temperature=self.config.temperature,
-        )
+        try:
+            return ChatOllama(
+                model=model,
+                base_url=self.config.ollama_base_url,
+                temperature=self.config.temperature,
+                timeout=self.config.llm_timeout_s,
+            )
+        except TypeError:
+            # Older langchain-ollama has no timeout parameter
+            return ChatOllama(
+                model=model,
+                base_url=self.config.ollama_base_url,
+                temperature=self.config.temperature,
+            )
 
     def _build_agent_pool(self):
         """One executor shared by everyone, plus N worker slots per role."""
@@ -490,6 +533,42 @@ class SimulationEngine:
                 datetime.fromtimestamp(next_start, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
             )
 
+    def _execute_with_retry(
+        self, state: ProcessState, worker: AgentWorker, case_id: str,
+    ) -> tuple[ProcessState, str | None, bool]:
+        """
+        Run one step, retrying transient failures.
+
+        Returns (state, next_role, failed). `failed` means every attempt
+        raised - the caller records the case as an error rather than
+        inventing an outcome for it.
+        """
+        last_error = None
+
+        for attempt in range(self.config.step_max_retries + 1):
+            try:
+                new_state, next_role = self._executor.execute_step(state, worker.role)
+                if attempt:
+                    logger.info("%s | recovered on attempt %d", case_id, attempt + 1)
+                return new_state, next_role, False
+            except Exception as e:
+                last_error = e
+                remaining = self.config.step_max_retries - attempt
+                logger.warning(
+                    "%s | step failed on %s (attempt %d/%d): %s: %s",
+                    case_id, worker.worker_id, attempt + 1,
+                    self.config.step_max_retries + 1,
+                    type(e).__name__, e,
+                )
+                if remaining:
+                    time.sleep(self.config.step_retry_wait_s)
+
+        logger.error(
+            "%s | step failed after %d attempts, recording as error: %s",
+            case_id, self.config.step_max_retries + 1, last_error,
+        )
+        return state, None, True
+
     def _dispatch_step(self, worker: AgentWorker, case_id: str, sim_time: float):
         """Run one step of `case_id` on `worker`. The case is already claimed."""
         state = self._case_states[case_id]
@@ -512,13 +591,23 @@ class SimulationEngine:
         )
 
         t0 = time.time()
-        try:
-            updated_state, next_role = self._executor.execute_step(state, worker.role)
-        except Exception as e:
-            logger.error("%s | EXECUTOR ERROR on %s: %s", case_id, worker.worker_id, e)
-            updated_state = merge_state(state, {"status": "rejected"})
-            next_role = None
+        updated_state, next_role, failed = self._execute_with_retry(
+            state, worker, case_id,
+        )
         wall_time = time.time() - t0
+
+        if failed:
+            # A step that could not run is a failure of the simulation,
+            # not a decision by an agent. Marking it as a rejection would
+            # put a fabricated outcome in the event log and quietly bias
+            # every downstream measure.
+            self._failed_cases.append(case_id)
+            self._agent_pool.release(worker.worker_id)
+            self._case_states[case_id] = merge_state(
+                updated_state, {"status": "error"},
+            )
+            self._complete_case(case_id, sim_time)
+            return
         self._case_wall_time[case_id] = self._case_wall_time.get(case_id, 0.0) + wall_time
 
         produced_action = (
@@ -576,6 +665,10 @@ class SimulationEngine:
             event_log=state["event_log"],
         )
         self._results.append(result)
+
+        every = self.config.checkpoint_every
+        if every and len(self._results) % every == 0:
+            self._write_checkpoint()
 
         path = "->".join(e["concept_name"] for e in state["event_log"])
         logger.info(
@@ -635,6 +728,9 @@ class SimulationEngine:
 
             self._print_progress()
 
+        if self.config.checkpoint_every:
+            self._write_checkpoint()
+
         self._print_summary()
         return self._results
 
@@ -678,6 +774,10 @@ class SimulationEngine:
         print(f"  Event log entries: {len(self._global_event_log)}")
         if self.config.duration_source in ("llm", "complexity"):
             print(f"  Duration fallbacks: {self._duration_fallbacks}")
+        if self._failed_cases:
+            print(f"  Cases that failed to run: {len(self._failed_cases)}")
+            print("    These carry status 'error' and should be excluded from")
+            print("    any comparison - they are missing data, not outcomes.")
         print(f"{'=' * 62}\n")
 
     # -- Duration analysis ---------------------
@@ -729,6 +829,57 @@ class SimulationEngine:
         })
 
     # -- Export --------------------------------
+
+    def _write_checkpoint(self) -> None:
+        """
+        Dump the events produced so far, overwriting the previous dump.
+
+        One rolling file rather than a numbered series: what matters is
+        being able to recover the current run, not to keep its history.
+        A failure here is logged and swallowed - losing a checkpoint is
+        an inconvenience, losing the run because the checkpoint raised
+        would be worse.
+        """
+        if not self._global_event_log:
+            return
+
+        path = self.output_dir / "checkpoint.json"
+        try:
+            payload = {
+                "completed_cases": len(self._results),
+                "total_cases": len(self.cases),
+                "failed_cases": self._failed_cases,
+                "events": self._global_event_log,
+            }
+            tmp = path.with_suffix(".json.tmp")
+            with open(tmp, "w") as f:
+                json.dump(payload, f, default=str)
+            tmp.replace(path)   # atomic, so a kill mid-write cannot corrupt it
+            logger.debug(
+                "Checkpoint at %d cases, %d events",
+                len(self._results), len(self._global_event_log),
+            )
+        except Exception as e:
+            logger.warning("Could not write checkpoint: %s", e)
+
+    def load_checkpoint(self, path: str | Path | None = None) -> dict | None:
+        """
+        Read a checkpoint back, for recovering a killed run.
+
+        The events can be exported to XES and evaluated exactly like a
+        completed run - the cases that finished are complete traces.
+        """
+        path = Path(path) if path else self.output_dir / "checkpoint.json"
+        if not path.exists():
+            return None
+        with open(path) as f:
+            data = json.load(f)
+        self._global_event_log = data.get("events", [])
+        logger.info(
+            "Loaded checkpoint: %d cases, %d events",
+            data.get("completed_cases", 0), len(self._global_event_log),
+        )
+        return data
 
     def export_xes(self, filename: str = "simulation.xes") -> Path:
         import pm4py
