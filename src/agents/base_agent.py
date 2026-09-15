@@ -17,6 +17,21 @@ from ..state import ProcessState, AgentAction
 logger = logging.getLogger("bps.base_agent")
 
 
+def _as_text(content) -> str:
+    """LangChain content is a str, or a list of blocks for some providers."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
 def _make_tool_func(schema_cls: type[BaseModel]):
     def tool_func(**kwargs):
         return schema_cls(**kwargs).model_dump()
@@ -30,6 +45,7 @@ class BaseAgent:
     tool_schemas: list[type[BaseModel]] = []
 
     def __init__(self, llm):
+        self._no_tool_calls = 0          # steps where the model returned no tool
         self._all_tools = {s.__name__: s for s in self.tool_schemas}
         self._base_llm = llm
         self._all_lc_tools = [
@@ -148,15 +164,17 @@ class BaseAgent:
         _log = logging.getLogger(f"bps.{self.name}")
         case_id = state["application"]["case_id"]
 
+        context_sent = self._build_case_context(state)
         messages = [
             SystemMessage(content=self.system_prompt),
-            {"role": "user", "content": self._build_case_context(state)},
+            {"role": "user", "content": context_sent},
         ]
 
         response: AIMessage = self._bind_available_tools(state).invoke(messages)
 
         if not response.tool_calls:
             _log.warning("%s | no tool call — retrying", case_id)
+            self._no_tool_calls += 1
             return {
                 "messages": [response],
                 "current_agent": self.name,
@@ -184,6 +202,8 @@ class BaseAgent:
             "tool_output":   tool_output,
             "sim_timestamp": state["sim_clock"],   # engine overwrites with DES time
             "real_duration": 0.0,                  # engine overwrites with DES duration
+            "context_sent":  context_sent,
+            "raw_content":   _as_text(response.content),
         }
 
         tool_message = ToolMessage(

@@ -125,6 +125,8 @@ class RuleBasedAgent:
             "tool_output":   output,
             "sim_timestamp": state["sim_clock"],
             "real_duration": 0.0,
+            "context_sent":  "",   # rule agents receive no prompt
+            "raw_content":   "",
         }
 
         result = {

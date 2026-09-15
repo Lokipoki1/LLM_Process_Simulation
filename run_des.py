@@ -36,6 +36,7 @@ from src.process.loan_application import LOAN_PROCESS
 from src.process.loan_application_rules import LOAN_PROCESS_RULES
 from src.simulation_controller import generate_synthetic_case, load_bpic_cases
 from src.logger import setup_logging
+from src.reasoning_export import write_reasoning, build_manifest, coverage
 
 load_dotenv()
 
@@ -139,7 +140,7 @@ def main():
         output_dir=args.output,
     )
 
-    engine.run(seed=args.seed)
+    results = engine.run(seed=args.seed)
 
     # Export
     engine.export_json("simulation.json")
@@ -173,6 +174,24 @@ def main():
 
         engine.duration_dataframe().to_csv(f"{args.output}/durations.csv", index=False)
         print(f"\n  Per-activity detail -> {args.output}/durations.csv")
+
+    # What the agents said about the cases -- the qualitative coding frame
+    manifest = build_manifest(
+        config,
+        LOAN_PROCESS_RULES if args.agents == "rules" else LOAN_PROCESS,
+        cases,
+        args.seed,
+    )
+    paths = write_reasoning(results, args.output, manifest)
+    if paths:
+        cov = coverage(results)
+        if not cov.empty:
+            print("\n  Recorded reasoning per tool:")
+            print(cov.to_string(index=False))
+        print(f"\n  Coding frame     -> {paths['csv']}")
+        print(f"  Full records     -> {paths['jsonl']}")
+        if "manifest" in paths:
+            print(f"  Run manifest     -> {paths['manifest']}")
 
     print()
 

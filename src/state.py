@@ -77,6 +77,8 @@ class AgentAction(TypedDict):
     tool_output: dict
     sim_timestamp: float
     real_duration: float
+    context_sent: str      # the exact prompt text the agent received
+    raw_content: str       # prose the model emitted alongside the tool call
 
 
 # ─────────────────────────────────────────────

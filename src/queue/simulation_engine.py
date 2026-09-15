@@ -157,6 +157,7 @@ class CaseResult:
     queue_time_s: float     # total time waiting in queues
     work_time_s: float      # total hands-on work time
     event_log: list = field(default_factory=list)
+    agent_history: list = field(default_factory=list)   # full reasoning trail
 
 
 # -------------------------------------------------
@@ -664,6 +665,7 @@ class SimulationEngine:
             queue_time_s=self._case_queue_time.get(case_id, 0.0),
             work_time_s=self._case_work_time.get(case_id, 0.0),
             event_log=state["event_log"],
+            agent_history=state["agent_history"],
         )
         self._results.append(result)
 
