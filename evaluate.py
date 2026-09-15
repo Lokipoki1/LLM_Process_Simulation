@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import glob
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -38,12 +39,40 @@ import pandas as pd
 from src.evaluation.log_utils import (
     load_xes, describe, prepare_reference_log, temporal_split,
     reference_window, shift_to_match, vocabulary_overlap,
-    ACTIVITY, CASE_ID,
+    match_by_case_id, ACTIVITY, CASE_ID,
 )
 from src.evaluation.metrics import (
     MEASURES_AVAILABLE, evaluate_log, aggregate_runs,
     variant_comparison, activity_comparison, trace_length_comparison,
 )
+
+
+class Tee:
+    """
+    Send everything printed to both the console and a file.
+
+    An evaluation run produces several pages of tables that end up in the
+    thesis. Copying them out of a terminal loses alignment, truncates
+    long lines, and leaves no record of which run produced which numbers.
+    Writing the report to a file alongside the metrics CSV keeps the
+    output reproducible and quotable.
+    """
+
+    def __init__(self, path: Path):
+        self.file = open(path, "w", encoding="utf-8")
+        self.stdout = sys.stdout
+
+    def write(self, text: str) -> int:
+        self.stdout.write(text)
+        self.file.write(text)
+        return len(text)
+
+    def flush(self) -> None:
+        self.stdout.flush()
+        self.file.flush()
+
+    def close(self) -> None:
+        self.file.close()
 
 
 def heading(text: str) -> None:
@@ -70,15 +99,21 @@ def parse_args():
                    help="Share of the reference log used for calibration")
     p.add_argument("--raw-lifecycle", action="store_true",
                    help="Do not fold schedule/start/complete into single activity instances")
+    p.add_argument("--no-pairing", action="store_true",
+                   help="Do not match cases by identifier, even when they overlap")
     p.add_argument("--no-align", action="store_true",
                    help="Do not shift the simulated log onto the reference window")
     p.add_argument("--csv", default=None, help="Write the metric table here")
+    p.add_argument("--report", default=None,
+                   help="Write the full text report here "
+                        "(default: <simulated log's folder>/evaluation.txt)")
+    p.add_argument("--no-report", action="store_true",
+                   help="Print to the console only")
     return p.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-
+def run(args) -> None:
+    """The evaluation itself. main() wraps this to capture the output."""
     if not MEASURES_AVAILABLE:
         print("log-distance-measures is not installed.\n"
               "  pip install log-distance-measures", file=sys.stderr)
@@ -158,13 +193,37 @@ def main() -> None:
         print("  as a result - a few hundred cases is the point where they")
         print("  start to settle.")
 
+    # -- pairing --------------------------------
+    # If the simulation replayed real cases it kept their identifiers, so
+    # the same applications exist on both sides and can be compared
+    # directly. That is a paired comparison and it is strictly better
+    # than lining up two different sets of cases from a nearby period.
+    _, _, overlap_info = match_by_case_id(reference, sim_logs[0])
+    paired = overlap_info["shared"] > 0 and not args.no_pairing
+
+    heading("Case pairing")
+    if paired:
+        print(f"  {overlap_info['shared']} of {overlap_info['simulated_cases']} "
+              f"simulated cases also appear in the reference log.")
+        print("  Comparing those directly: same applications, same arrivals,")
+        print("  so every difference comes from how they were processed.")
+        if overlap_info["simulated_only"]:
+            print(f"  {overlap_info['simulated_only']} simulated case(s) have no "
+                  f"counterpart and are excluded.")
+    else:
+        print("  No shared case identifiers - falling back to a contiguous")
+        print("  block of reference arrivals. Absolute-time measures (AED,")
+        print("  CAR) will reflect the gap between two different sets of")
+        print("  cases as much as anything the simulator did.")
+
     heading("Distance measures")
     run_tables = []
     for path, sim in zip(sim_paths, sim_logs):
-        # A contiguous block of arrivals, so the reference covers a span
-        # comparable to the simulation's rather than a year-wide scatter.
-        ref_block = reference_window(reference, sim[CASE_ID].nunique())
-        sim_aligned = sim if args.no_align else shift_to_match(sim, ref_block)
+        if paired:
+            ref_block, sim_aligned, _ = match_by_case_id(reference, sim)
+        else:
+            ref_block = reference_window(reference, sim[CASE_ID].nunique())
+            sim_aligned = sim if args.no_align else shift_to_match(sim, ref_block)
 
         table = evaluate_log(
             ref_block, sim_aligned,
@@ -191,11 +250,10 @@ def main() -> None:
 
     # -- descriptive ---------------------------
     primary = sim_logs[0]
-    reference = reference_window(reference, primary[CASE_ID].nunique())
-
-    if not args.no_align:
-        print(f"\n  Simulated logs shifted onto the reference window "
-              f"(first arrival {reference[CASE_ID].nunique()} cases).")
+    if paired:
+        reference, primary, _ = match_by_case_id(reference, primary)
+    else:
+        reference = reference_window(reference, primary[CASE_ID].nunique())
 
     heading("Trace length")
     print(trace_length_comparison(reference, primary).to_string(index=False))
@@ -240,6 +298,43 @@ def main() -> None:
         print(f"\n  Metrics -> {args.csv}")
 
     print()
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.no_report:
+        run(args)
+        return
+
+    if args.report:
+        report_path = Path(args.report)
+    else:
+        first = sorted(glob.glob(args.simulated)) or [args.simulated]
+        report_path = Path(first[0]).parent / "evaluation.txt"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    tee = Tee(report_path)
+    sys.stdout = tee
+    exit_code = 0
+    try:
+        print(f"Evaluation report")
+        print(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Simulated: {args.simulated}")
+        print(f"Reference: {args.reference}")
+        print(f"Options:   n-gram={args.n_gram}  "
+              f"split={'off' if args.no_split else args.train_fraction}  "
+              f"align={'off' if args.no_align else 'on'}  "
+              f"lifecycle={'raw' if args.raw_lifecycle else 'collapsed'}")
+        run(args)
+    except SystemExit as e:
+        exit_code = e.code or 0
+    finally:
+        sys.stdout = tee.stdout
+        tee.close()
+        print(f"  Report -> {report_path}")
+    if exit_code:
+        sys.exit(exit_code)
 
 
 if __name__ == "__main__":

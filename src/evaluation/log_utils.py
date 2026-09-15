@@ -377,3 +377,44 @@ def shift_to_match(simulated: pd.DataFrame, reference: pd.DataFrame) -> pd.DataF
     out[START] = out[START] + delta
     out[END] = out[END] + delta
     return out
+
+
+def select_cases(df: pd.DataFrame, case_ids: set[str]) -> pd.DataFrame:
+    """Keep only the given cases, preserving their order."""
+    return df[df[CASE_ID].isin(case_ids)].reset_index(drop=True)
+
+
+def match_by_case_id(
+    reference: pd.DataFrame, simulated: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """
+    Restrict both logs to the cases they have in common.
+
+    When the simulation replays real cases it keeps their identifiers, so
+    the same application exists in both logs. Comparing those directly
+    turns the evaluation into a paired design: one loan application, two
+    ways of handling it. Every difference is then attributable to the
+    simulator, with the case mix and the arrival pattern held fixed by
+    construction.
+
+    Without this the reference side is a block of DIFFERENT applications
+    from a nearby period, and the absolute-time measures pick up the gap
+    between the two blocks rather than anything about behaviour.
+
+    Returns both filtered logs and a small report of the overlap.
+    """
+    ref_ids = set(reference[CASE_ID].unique())
+    sim_ids = set(simulated[CASE_ID].unique())
+    shared = ref_ids & sim_ids
+
+    info = {
+        "reference_cases": len(ref_ids),
+        "simulated_cases": len(sim_ids),
+        "shared": len(shared),
+        "simulated_only": len(sim_ids - ref_ids),
+    }
+
+    if not shared:
+        return reference, simulated, info
+
+    return select_cases(reference, shared), select_cases(simulated, shared), info

@@ -482,6 +482,7 @@ class SimulationEngine:
                     last_action,
                     self.process.activity_map,
                     self.process.resource_map,
+                    start_timestamp=dispatch_time,
                 ))
                 self._global_event_log.append(xes_entry)
                 state = merge_state(state, {"event_log": [xes_entry]})
