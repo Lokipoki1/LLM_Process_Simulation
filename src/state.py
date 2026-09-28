@@ -1,8 +1,8 @@
 """
 state.py
 --------
-Define el contrato de datos central del framework.
-Todo nodo de LangGraph lee y escribe sobre este TypedDict.
+Data contracts for the simulation: the case data, the agent action
+record, the XES entry and the per-case process state.
 """
 
 from __future__ import annotations
@@ -11,102 +11,85 @@ from typing import Annotated, Optional
 from typing_extensions import TypedDict
 
 
-# ─────────────────────────────────────────────
-# 1. Datos del caso de préstamo
-# ─────────────────────────────────────────────
+# -------------------------------------------------
+# 1. Initial application data (client submits this)
+#    BPIC 2017 case-level attributes
+# -------------------------------------------------
 
-class LoanCase(TypedDict):
-    """
-    Atributos de un caso de préstamo.
-    Los campos reales (amount_requested, etc.) vienen del BPIC 2012/2017.
-    Los campos sintéticos (credit_score, monthly_income) se samplearán
-    con distribuciones estadísticas derivadas del mismo dataset.
-    """
+class LoanApplication(TypedDict):
+    """What the client submits (BPIC 2017 case attributes). All the JC sees."""
     case_id: str
     amount_requested: float
-    loan_goal: str                   # e.g. "car", "home_improvement"
-    number_of_terms: int             # meses
-    monthly_cost: float
-
-    # Campos sintéticos (generados estadísticamente)
-    credit_score: int                # 300–850
-    monthly_income: float
-    applicant_id: str
+    loan_goal: str               # "Car", "Existing loan takeover", etc.
+    application_type: str        # "New credit", "Limit raise", etc.
 
 
-# ─────────────────────────────────────────────
-# 2. Registro de acciones de agentes
-# ─────────────────────────────────────────────
+# -------------------------------------------------
+# 2. Credit bureau data (bank discovers this)
+#    BPIC 2017 offer-level attributes
+# -------------------------------------------------
+
+class CreditBureauData(TypedDict):
+    """
+    Revealed by CheckCreditScore (BPIC 2017 O_Create Offer attributes).
+    None for cases that never reached the offer stage.
+    """
+    credit_score: Optional[int]
+    monthly_cost: Optional[float]
+    number_of_terms: Optional[int]
+    offered_amount: Optional[float]
+
+
+# -------------------------------------------------
+# 3. Agent action record
+# -------------------------------------------------
 
 class AgentAction(TypedDict):
-    """
-    Captura cada tool call que ejecuta un agente.
-    El ObserverModule convierte esto en una entrada XES.
-    """
-    agent_name: str                  # "junior_clerk" | "senior_clerk" | "credit_officer"
-    tool_name: str                   # nombre de la tool Pydantic ejecutada
-    tool_input: dict                 # parámetros con los que se llamó
-    tool_output: dict                # resultado estructurado devuelto
-    sim_timestamp: float             # tiempo lógico de simulación (segundos)
-    real_duration: float             # duración samplea de BPIC (segundos)
+    agent_name: str
+    tool_name: str
+    tool_input: dict
+    tool_output: dict
+    sim_timestamp: float
+    real_duration: float
+    context_sent: str      # the exact prompt text the agent received
+    raw_content: str       # prose the model emitted alongside the tool call
 
 
-# ─────────────────────────────────────────────
-# 3. Entrada del event log (formato XES)
-# ─────────────────────────────────────────────
+# -------------------------------------------------
+# 4. XES event log entry
+# -------------------------------------------------
 
 class XESEntry(TypedDict):
-    """
-    Estructura mínima compatible con PM4Py / IEEE XES.
-    Nombres de campo exactos que PM4Py espera para importación.
-    """
-    case_concept_name: str           # case:concept:name  → case_id
-    concept_name: str                # concept:name       → nombre de la actividad
-    time_timestamp: str              # time:timestamp     → ISO 8601
-    org_resource: str                # org:resource       → nombre del agente
-    lifecycle_transition: str        # "complete" por defecto
+    case_concept_name: str
+    concept_name: str
+    start_timestamp: str
+    time_timestamp: str
+    org_resource: str
+    lifecycle_transition: str
 
 
-# ─────────────────────────────────────────────
-# 4. Estado global del proceso (ProcessState)
-# ─────────────────────────────────────────────
+# -------------------------------------------------
+# 5. Process state
+# -------------------------------------------------
 
 class ProcessState(TypedDict):
-    """
-    Estado compartido que fluye a través del grafo LangGraph.
+    """Shared state for a single case. List fields are append-only."""
+    # Case data
+    application: LoanApplication
+    credit_bureau_data: Optional[dict]    # CreditBureauData, None until loaded
+    credit_checked: bool                  # False until SC calls CheckCreditScore
 
-    Convención de anotaciones:
-    - Annotated[list, operator.add] → LangGraph hace append automático
-      cuando un nodo devuelve una lista parcial (no reemplaza la lista completa).
-    - Campos sin Annotated → el nodo devuelve el valor nuevo completo.
-    """
+    # Process control
+    status: str
+    current_agent: str
+    rework_count: int
+    rejection_reason: Optional[str]
+    next_agent: Optional[str]
 
-    # ── Caso activo ──────────────────────────
-    case: LoanCase
-    status: str                      # "pending" | "in_review" | "approved" | "rejected"
-    current_agent: str               # nombre del agente que tiene el turno
-
-    # ── Memoria conversacional ───────────────
-    # Lista de mensajes LangChain (HumanMessage, AIMessage, ToolMessage).
-    # operator.add hace que cada nodo solo devuelva los mensajes nuevos
-    # y LangGraph los concatena al historial global automáticamente.
+    # Append-only collections
     messages: Annotated[list, operator.add]
-
-    # ── Historial de acciones (append-only) ──
-    # Fuente de verdad para el ObserverModule.
     agent_history: Annotated[list[AgentAction], operator.add]
-
-    # ── Reloj lógico de simulación ───────────
-    # Tiempo en segundos desde el inicio de la simulación.
-    # El ObserverModule lo avanza usando distribuciones del BPIC.
-    sim_clock: float
-
-    # ── Event log (append-only) ──────────────
-    # Se construye en paralelo al agent_history.
-    # Al final de la simulación se exporta a .xes vía PM4Py.
     event_log: Annotated[list[XESEntry], operator.add]
 
-    # ── Control de flujo ─────────────────────
-    revision_count: int              # cuántas veces volvió al Junior Clerk
-    rejection_reason: Optional[str]  # si status == "rejected"
-    next_agent: Optional[str]        # hint de routing para los conditional edges
+    # Simulation clock
+    sim_clock: float
