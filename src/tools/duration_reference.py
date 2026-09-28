@@ -1,51 +1,24 @@
 """
 duration_reference.py
 ---------------------
-Reference durations per activity, and the complexity scale that agents
-use to place a specific case against them.
+Reference durations per activity, and the complexity scale agents use
+to place a case against them.
 
-Why this split exists
----------------------
-Two earlier configurations both failed, in opposite directions:
+  the AGENT   rates how complex this case was, on a 1-5 scale
+  the ENGINE  turns that rating into minutes: anchor x multiplier
 
-  Uncalibrated absolute estimates
-      gpt-4o-mini answered 5 minutes for a credit bureau query and 10
-      for a rework request: 10x to 16x below the fitted distributions.
-      With every step taking 5-30 minutes the workers never saturate,
-      no queue forms, nothing crosses a shift boundary, and every case
-      closes the same day. The queueing dynamics the engine exists to
-      model disappear.
-
-  Anchored absolute estimates
-      Given a reference band, the model copied the typical figure
-      verbatim. Eight of ten tools came back with zero variance and a
-      ratio of exactly 1.00 against their anchor. The scale was right
-      and the agent contributed nothing beyond the anchor.
-
-The reading of those two results is that the model is poor at absolute
-temporal magnitude, but is being asked the wrong question. Judging
-whether a file is straightforward or messy is a reading task, which is
-what it is good at. So the question is split:
-
-  the AGENT   judges how complex this case was, on a 1-5 scale
-  the ENGINE  turns that judgement into minutes, against an anchor
-              derived from the reference log
-
-Variance now comes from the agent's reading of each case rather than
-from its arithmetic, and the scale is guaranteed by construction.
-
-Agents are ALSO asked for a free, unanchored estimate of how long the
-task usually takes. That number never advances the clock - it is
-recorded so the two abilities can be reported separately: calibration in
-absolute magnitude, and discrimination of relative complexity.
+LLMs estimate absolute durations poorly (far too short unanchored,
+copied verbatim when anchored), but judging complexity is a reading
+task. Agents also give a free estimate of the typical duration, which
+is recorded for analysis but never advances the clock.
 """
 
 from __future__ import annotations
 
 # tool_name -> typical hands-on minutes for an ordinary case.
 # Medians of the log-normal parameters in clock/simulation_clock.py.
-# Regenerate from the reference log with build_anchors_from_distributions()
-# once the activity-label mapping is settled.
+# build_anchors_from_distributions() regenerates this table from fitted
+# distributions keyed by tool name.
 DURATION_ANCHOR: dict[str, int] = {
     # Junior Clerk
     "IntakeApplication":      30,
@@ -100,13 +73,8 @@ def resolve_minutes(tool_name: str, complexity: int) -> float | None:
 
 def complexity_prompt_block() -> str:
     """
-    The duration section of an agent's system prompt.
-
-    Deliberately contains NO reference durations. The agent is asked for
-    a free estimate of the typical time - recorded but never used to
-    advance the clock - and for a complexity judgement, which is.
-    Withholding the anchor is what keeps the free estimate usable as
-    evidence about the model's unaided calibration.
+    The duration section of an agent's system prompt. Deliberately
+    contains no reference durations, so the free estimate stays unaided.
     """
     return f"""
 === TIME AND COMPLEXITY ===
@@ -135,14 +103,7 @@ complexity_rationale, then case_complexity
 def build_anchors_from_distributions(
     distributions: dict[str, tuple[float, float]],
 ) -> dict[str, int]:
-    """
-    Rebuild the anchor table from fitted log-normal parameters.
-    For parameters (mu, sigma) in seconds, the anchor is exp(mu) / 60.
-
-    Args:
-        distributions: {tool_name: (mu, sigma)}, as produced by
-                       extract_bpic_distributions()
-    """
+    """Rebuild the anchor table from {tool_name: (mu, sigma)}: exp(mu) / 60."""
     import math
     return {
         name: max(1, round(math.exp(mu) / 60))

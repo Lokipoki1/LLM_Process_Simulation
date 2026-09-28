@@ -1,19 +1,10 @@
 """
 junior_clerk.py
+---------------
 The JC only sees: amount_requested, loan_goal, application_type.
-No credit score, no monthly cost, no income.
 
-No numeric thresholds
-    Earlier versions of this prompt named figures - flag anything above
-    EUR 50,000, treat EUR 200,000 for a car as impossible. Those were
-    removed on purpose. A stated threshold turns the agent into a
-    decision table written in prose, and makes it impossible to tell
-    whether a decision came from the agent's reading of the file or from
-    a number someone handed it.
-
-    What is left is what a real procedures manual contains: the kind of
-    thing to look for, and the judgement left to the person holding the
-    file.
+The prompt deliberately names no numeric thresholds, so decisions come
+from the agent's reading of the file rather than from a rule in prose.
 """
 
 from __future__ import annotations

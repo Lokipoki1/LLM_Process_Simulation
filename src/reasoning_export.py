@@ -1,21 +1,15 @@
 """
-reasoning_export.py — the qualitative analysis artifact
-──────────────────────────────────────────────────────
-The XES log records what the agents DID. This module records what they SAID,
-which is what the qualitative analysis codes.
+reasoning_export.py
+-------------------
+Export of the agents' reasoning for qualitative analysis.
 
 Writes three files next to the run output:
 
-  reasoning.csv      one row per activity — the coding frame
+  reasoning.csv      one row per activity - the coding frame
   reasoning.jsonl    the same rows plus the full context each agent received
-  run_manifest.json  model, flags, anchors and the verbatim system prompts
+  run_manifest.json  run configuration and the verbatim system prompts
 
-Why the manifest matters: the emergent-criteria analysis claims a criterion is
-absent from any prompt. That claim is only checkable if the prompts as they
-stood at run time travel with the run.
-
-Silent tools are NOT filtered here. CheckCreditScore carries the senior clerk's
-reasoning and belongs in the coding frame even though it never reaches the log.
+Silent tools are included: they carry reasoning even without a log event.
 """
 
 from __future__ import annotations

@@ -1,16 +1,9 @@
 """
 loan_application_rules.py
 -------------------------
-The same loan process, with deterministic agents instead of LLM agents.
-
-Identical to LOAN_PROCESS in every respect the engine can observe:
-same roles, same tools, same routing, same activity vocabulary, same
-schedules, same initial state. The only difference is which classes sit
-behind the roles.
-
-That makes the two runs a controlled comparison. Run both over the same
-cases with the same seed, and every difference in the resulting event
-log is attributable to how the next action was chosen.
+The same loan process with deterministic agents instead of LLM agents.
+Everything else is identical to LOAN_PROCESS, so the two runs form a
+controlled comparison.
 """
 
 from __future__ import annotations

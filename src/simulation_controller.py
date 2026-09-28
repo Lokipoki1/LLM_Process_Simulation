@@ -1,11 +1,7 @@
 """
 simulation_controller.py
 ------------------------
-Case loading and synthetic case generation for the BPIC 2017 structure.
-
-Two sources of cases:
-  - load_bpic_cases():         real cases from the BPIC 2017 XES log
-  - generate_synthetic_case(): synthetic cases for quick testing
+Case loading (BPIC 2017) and synthetic case generation.
 
 Both return dicts with the same shape:
     {
@@ -13,26 +9,6 @@ Both return dicts with the same shape:
       "arrival_time": float | None,
       "credit_bureau_data": {...} | None
     }
-
-Arrival times
-    load_bpic_cases() reads the timestamp of each case's FIRST event and
-    returns it as `arrival_time`. The engine can then replay the real
-    arrival sequence instead of inventing one.
-
-    This matters for evaluation. Absolute-time measures (AED) and the
-    case arrival measure (CAR) are driven by when cases enter the
-    system. With invented arrivals, those measures report the distance
-    between a chosen Poisson rate and the bank's real demand pattern -
-    a fact about the arrival model, not about the simulator. Replaying
-    real arrivals removes that confound: every remaining temporal
-    difference is something the engine did.
-
-Case selection
-    Cases are returned in ARRIVAL ORDER, and `max_cases` takes a
-    contiguous block from the start rather than the alphabetically first
-    IDs. A scattered sample would spread a handful of cases across a
-    year of calendar time, which makes any absolute-time comparison
-    meaningless.
 """
 
 from __future__ import annotations
@@ -49,11 +25,8 @@ APP_TYPES = ["New credit", "Limit raise"]
 
 def generate_synthetic_case(case_id: str, rng: np.random.Generator) -> dict:
     """
-    Generate a synthetic case following the BPIC 2017 structure.
-
-    Profiles are mixed (50% good / 25% borderline / 25% bad) so a run
-    produces a spread of outcomes rather than all approvals. Synthetic
-    cases carry no arrival time - the engine generates those.
+    Generate a synthetic case (50% good / 25% borderline / 25% bad
+    profile). No arrival time - the engine generates those.
     """
     profile = rng.choice(["good", "borderline", "bad"], p=[0.50, 0.25, 0.25])
 
@@ -96,30 +69,13 @@ def load_bpic_cases(
     offset: int = 0,
 ) -> list[dict]:
     """
-    Load real cases from a BPIC 2017 XES file, in arrival order.
+    Load real cases from a BPIC 2017 XES file.
 
-    Case-level attributes -> application data (visible from the start):
-      case:concept:name  -> case_id
-      RequestedAmount    -> amount_requested
-      LoanGoal           -> loan_goal
-      ApplicationType    -> application_type
-      first timestamp    -> arrival_time
-
-    Offer-level attributes -> credit bureau data (revealed by the SC):
-      CreditScore        -> credit_score
-      MonthlyCost        -> monthly_cost
-      NumberOfTerms      -> number_of_terms
-      OfferedAmount      -> offered_amount
-
-    Cases the bank never took to the offer stage have
-    credit_bureau_data=None: the bank never ran the credit check.
-
-    Args:
-        xes_path:  path to the XES file
-        max_cases: size of the contiguous block to take
-        offset:    where the block starts, in arrival order. Use this to
-                   evaluate on a later period than the one used for
-                   calibration.
+    Takes a contiguous block of `max_cases` cases in arrival order,
+    starting at `offset`, so the block covers a compact period of time.
+    arrival_time is each case's first event. Case attributes become the
+    application; O_Create Offer attributes become the credit bureau data
+    (None when the case never reached an offer).
     """
     import pm4py
 

@@ -3,32 +3,10 @@ log_utils.py
 ------------
 Loading, filtering and splitting event logs for evaluation.
 
-Comparing a synthetic log to a reference log only means something if the
-two are put on equal footing first. Three preparations matter:
-
-Vocabulary filtering
-    The simulation produces 8 of the 26 activities in BPIC 2017. Left
-    unfiltered, every label-based distance would be dominated by the 18
-    activities the simulation never claims to model, and would report a
-    large distance no matter how faithful the modelled behaviour is.
-
-    Restricting the reference log to the simulated vocabulary is the
-    standard move, not a shortcut: "BPI17W" - the subset AgentSimulator
-    and several earlier BPS papers evaluate on - is itself exactly this
-    kind of preprocessing choice, keeping only the W_ work-item
-    activities. What matters is documenting the filter and reporting the
-    before/after counts, which prepare_reference_log() returns.
-
-Temporal splitting
-    Fitting anything on the same cases used to report results inflates
-    the result. The convention in this literature is a temporal hold-out
-    - the first portion of the log by case arrival for calibration, the
-    last portion for evaluation - excluding cases that straddle the
-    boundary, since those are truncated in one half.
-
-Equal case counts
-    Some measures (control-flow log distance, case arrival distance)
-    require both logs to hold the same number of cases.
+  - vocabulary filtering: restrict the reference log to the simulated
+    activities (8 of the 26 in BPIC 2017), reporting before/after counts
+  - temporal splitting: calibration / evaluation hold-out by case arrival
+  - case matching and alignment, for measures that need equal case counts
 """
 
 from __future__ import annotations
@@ -77,25 +55,9 @@ def load_xes(path: str | Path, collapse_lifecycle: bool = True) -> pd.DataFrame:
     """
     Read an XES file into the flat frame the measures expect.
 
-    Lifecycle collapsing
-        BPIC 2017 records each work item as several events sharing one
-        activity name and differing in lifecycle:transition - typically
-        schedule, start, and complete. Read naively, every activity
-        instance is counted two or three times: 628,662 events across
-        31,509 cases, or about 20 events per case, where the published
-        BPI17W subset holds roughly 8.
-
-        Collapsing turns each schedule/start/complete group back into
-        ONE activity instance carrying a start and an end timestamp,
-        which is what the temporal measures expect and what makes trace
-        lengths comparable to a simulation that performs each activity
-        once.
-
-        Pass collapse_lifecycle=False to keep the raw events.
-
-    Logs with a single timestamp per event get start = end, making every
-    activity instantaneous. That is right for state changes and wrong
-    for work items.
+    With collapse_lifecycle, each schedule/start/complete group becomes
+    one activity instance with a start and end timestamp. Logs without a
+    start timestamp get start = end.
     """
     import pm4py
 
@@ -140,12 +102,8 @@ def load_xes(path: str | Path, collapse_lifecycle: bool = True) -> pd.DataFrame:
 def _collapse_lifecycle(df: pd.DataFrame) -> pd.DataFrame:
     """
     Fold schedule/start/complete groups into single activity instances.
-
-    Events are walked in order within each case. A group is opened by
-    the first non-complete transition for an activity and closed by the
-    next complete for that same activity, so a case that performs an
-    activity twice still yields two instances rather than one long one.
-    An unmatched complete becomes an instantaneous instance.
+    A group opens on the first non-complete transition and closes on the
+    next complete of the same activity.
     """
     rows = []
 
@@ -207,13 +165,7 @@ def filter_to_vocabulary(
     vocabulary: set[str] | frozenset[str],
     drop_empty_cases: bool = True,
 ) -> pd.DataFrame:
-    """
-    Keep only events whose activity is in `vocabulary`.
-
-    Cases left with no events are dropped by default: an empty trace
-    contributes nothing to a control-flow comparison but would still be
-    counted as a case, skewing per-case measures.
-    """
+    """Keep only events whose activity is in `vocabulary`; drop emptied cases."""
     out = df[df[ACTIVITY].isin(vocabulary)].copy()
     if drop_empty_cases:
         keep = out.groupby(CASE_ID).size()
@@ -228,12 +180,7 @@ def prepare_reference_log(
 ) -> tuple[pd.DataFrame, LogStats, LogStats]:
     """
     Load a reference log and restrict it to the simulated vocabulary.
-
-    Returns the filtered frame plus the before and after statistics. The
-    caller needs both: the two rows go in the preprocessing table, and
-    the raw activity list is what diagnoses an empty result, which
-    happens when the simulation emits labels the reference log does not
-    contain.
+    Returns (filtered, stats_before, stats_after).
     """
     raw = load_xes(path, collapse_lifecycle=collapse_lifecycle)
     before = describe(raw, "reference (raw)")
@@ -246,15 +193,7 @@ def vocabulary_overlap(
     simulated_vocabulary: set[str] | frozenset[str],
     reference_activities: list[str],
 ) -> dict[str, list[str]]:
-    """
-    How the two activity vocabularies line up.
-
-    A label the simulation emits that the reference log does not contain
-    can never be matched: it contributes its full weight to every
-    label-based distance and, once the reference log is filtered to the
-    simulated vocabulary, removes real events without adding any.
-    Zero overlap empties the reference log entirely.
-    """
+    """Matched, simulated-only and reference-only activity labels."""
     sim = set(simulated_vocabulary)
     ref = set(reference_activities)
     return {
@@ -272,13 +211,7 @@ def temporal_split(
     df: pd.DataFrame,
     train_fraction: float = 0.8,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Split by case arrival time, dropping cases that straddle the cut.
-
-    A case that starts before the boundary and ends after it is
-    truncated in the training half and headless in the test half, so it
-    belongs to neither.
-    """
+    """Split by case arrival time, dropping cases that straddle the cut."""
     if df.empty:
         raise ValueError(
             "Cannot split an empty log. If this is the reference log after "
@@ -310,13 +243,7 @@ def temporal_split(
 
 
 def sample_cases(df: pd.DataFrame, n: int, seed: int = 42) -> pd.DataFrame:
-    """
-    Take a random sample of `n` complete cases.
-
-    Several measures require both logs to hold the same number of cases;
-    this trims the larger one. Sampling by case, never by event, keeps
-    traces intact.
-    """
+    """Take a random sample of `n` complete cases."""
     ids = pd.Series(df[CASE_ID].unique())
     if len(ids) <= n:
         return df.reset_index(drop=True)
@@ -334,17 +261,8 @@ def align_case_counts(
 
 def reference_window(df: pd.DataFrame, n_cases: int, seed: int = 42) -> pd.DataFrame:
     """
-    Take a contiguous block of `n_cases` consecutive arrivals.
-
-    Absolute-time measures (AED, CAR) compare calendar positions, so
-    they only mean something if the two logs cover a comparable span.
-    Sampling cases at random from a year-long log spreads them across
-    that whole year, while a short simulation covers days - the measure
-    then reports the distance between two calendars rather than between
-    two behaviours.
-
-    Taking consecutive arrivals keeps the reference block as dense in
-    time as the simulation is, which is the comparison actually wanted.
+    Take a block of `n_cases` consecutive arrivals, so the reference
+    covers a time span comparable to the simulation (for AED and CAR).
     """
     arrivals = df.groupby(CASE_ID)[START].min().sort_values()
     if len(arrivals) <= n_cases:
@@ -357,18 +275,7 @@ def reference_window(df: pd.DataFrame, n_cases: int, seed: int = 42) -> pd.DataF
 
 
 def shift_to_match(simulated: pd.DataFrame, reference: pd.DataFrame) -> pd.DataFrame:
-    """
-    Move the simulated log so its first arrival coincides with the
-    reference block's first arrival.
-
-    The simulation runs on an arbitrary start date. Without this shift,
-    AED and CAR measure the gap between two calendars. Shifting removes
-    that offset and leaves them measuring what they are meant to: the
-    shape of activity over time within the covered period.
-
-    Report that the shift was applied - it is a deliberate alignment
-    choice, not a neutral step.
-    """
+    """Shift the simulated log so its first arrival matches the reference's."""
     sim_start = simulated[START].min()
     ref_start = reference[START].min()
     delta = ref_start - sim_start
@@ -388,20 +295,8 @@ def match_by_case_id(
     reference: pd.DataFrame, simulated: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     """
-    Restrict both logs to the cases they have in common.
-
-    When the simulation replays real cases it keeps their identifiers, so
-    the same application exists in both logs. Comparing those directly
-    turns the evaluation into a paired design: one loan application, two
-    ways of handling it. Every difference is then attributable to the
-    simulator, with the case mix and the arrival pattern held fixed by
-    construction.
-
-    Without this the reference side is a block of DIFFERENT applications
-    from a nearby period, and the absolute-time measures pick up the gap
-    between the two blocks rather than anything about behaviour.
-
-    Returns both filtered logs and a small report of the overlap.
+    Restrict both logs to their shared case IDs (a paired comparison of
+    replayed cases). Returns both logs and an overlap report.
     """
     ref_ids = set(reference[CASE_ID].unique())
     sim_ids = set(simulated[CASE_ID].unique())

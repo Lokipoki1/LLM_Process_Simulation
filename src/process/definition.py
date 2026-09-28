@@ -1,19 +1,9 @@
 """
 definition.py
 -------------
-ProcessDefinition: everything the simulation engine needs to know about
-a specific business process, and nothing it needs to know about how to
-simulate one.
-
-This type is the boundary of the framework. Above it, the engine
-(events, queues, schedules, clock, XES export) is domain-agnostic:
-nothing in src/queue/ mentions loans, credit scores or clerks. Below it,
-a process instantiation supplies its own roles, tools, agent personas and
-routing rules.
-
-Porting the framework to another process means writing one new module
-that constructs a ProcessDefinition, plus the state fields, Pydantic
-tools and agent personas it points at. The engine is not touched.
+ProcessDefinition: everything the engine needs to know about a specific
+business process. The engine in src/queue/ is domain-agnostic; porting
+to another process means writing a new ProcessDefinition.
 
 See loan_application.py for the reference instantiation.
 """
@@ -32,47 +22,16 @@ class ProcessDefinition:
     A complete, self-contained description of one business process.
 
     Attributes:
-        name
-            Human-readable process name, used in logs and reports.
-
-        entry_role
-            The role a newly arrived case is queued for.
-
-        agent_classes
-            role -> BaseAgent subclass. The executor instantiates one
-            agent per role and shares it across every worker of that role,
-            the way two clerks follow the same job description.
-
-        valid_transitions
-            role -> the set of roles a case may move to from there. The
-            engine rejects any other move, which catches an agent that
-            hallucinates a routing target. A role that can continue its
-            own sequence must include itself.
-
-        activity_map
-            tool name -> XES activity label. This is where the process
-            vocabulary is defined, and the place to align labels with a
-            reference log when computing NGD or a directly-follows graph.
-
-        resource_map
-            role -> org:resource label in the exported log.
-
-        silent_tools
-            Tools that advance the case but emit NO event in the log.
-            Use this for internal handovers that the real system does not
-            record: a clerk passing a file to a colleague changes who
-            holds it, but a bank's information system logs activities,
-            not handoffs. Emitting them inflates trace length and
-            distorts any label-based distance metric.
-
-        initial_state
-            Builds the ProcessState for a case, given the raw case dict
-            from the data loader. This is where the domain schema
-            (which fields exist, what starts hidden) is fixed.
-
-        default_schedules
-            role -> WorkSchedule. Used when the run configuration does
-            not override a role's hours.
+        name               human-readable process name
+        entry_role         role a newly arrived case is queued for
+        agent_classes      role -> agent class (one instance shared per role)
+        valid_transitions  role -> roles a case may move to; a role that
+                           continues its own sequence must include itself
+        activity_map       tool name -> XES activity label
+        resource_map       role -> org:resource label
+        silent_tools       tools that advance the case but emit no event
+        initial_state      raw case dict -> ProcessState
+        default_schedules  role -> WorkSchedule, unless the config overrides
     """
 
     name: str
@@ -105,13 +64,7 @@ class ProcessDefinition:
         return self.resource_map.get(role, role)
 
     def validate(self) -> list[str]:
-        """
-        Structural check of the definition. Returns a list of problems;
-        an empty list means the definition is internally consistent.
-
-        Run this once at startup - a malformed definition otherwise shows
-        up as a stalled case halfway through a simulation.
-        """
+        """Structural check of the definition; returns a list of problems."""
         problems: list[str] = []
         roles = set(self.agent_classes)
 

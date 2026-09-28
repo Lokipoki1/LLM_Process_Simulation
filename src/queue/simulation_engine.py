@@ -3,36 +3,15 @@ simulation_engine.py
 --------------------
 Discrete Event Simulation (DES) engine for multi-LLM-agent BPS.
 
-Domain-agnostic by construction: this module names no role, no activity
-and no case attribute. Everything process-specific arrives through a
-ProcessDefinition, so the same engine simulates a loan application, a
-hospital admission or a support workflow without modification.
+Domain-agnostic: everything process-specific comes from a
+ProcessDefinition. The engine owns the event queue and timeline, the
+role queues and shifts, activity durations, and the event log.
 
-What it does own:
-  - the event queue and the simulation timeline
-  - one shared FIFO queue per role feeding several workers
-  - working hours, including suspending work across shift boundaries
-  - deciding how long each activity takes and when it finishes
-  - emitting the event log
-
-CLOCK OWNERSHIP
-    For each step the engine determines the hands-on work time exactly
-    once, spreads it across the worker's shift windows, schedules the
-    completion event, and stamps the XES entry with the completion time.
-    The executor performs the LLM call and never touches a clock.
-
-DURATION SOURCE
-    config.duration_source selects where work time comes from:
-
-      "llm"           the agent's own duration_minutes estimate.
-                      Time estimation becomes part of the agent's
-                      cognition rather than a statistical module.
-      "distribution"  a sample from the fitted log-normal in
-                      SimulationClock - the AgentSimulator-style baseline.
-
-    Both run on identical cases, so the two are directly comparable.
-    Under "llm" an unusable estimate falls back to the distribution and
-    is counted in duration_fallbacks.
+config.duration_source selects where work time comes from:
+  "complexity"    (default) agent's 1-5 rating x per-tool anchor
+  "llm"           agent's own typical_duration_minutes estimate
+  "distribution"  sample from the log-normal in SimulationClock
+An unusable agent answer falls back to the distribution.
 """
 
 from __future__ import annotations
@@ -66,25 +45,16 @@ logger = logging.getLogger("bps.engine")
 
 @dataclass
 class EngineConfig:
-    """
-    Run configuration. Nothing here names a specific role: the workforce
-    is a role -> headcount map filled in from the ProcessDefinition's
-    roles by the caller.
-    """
+    """Run configuration."""
     # role -> number of workers. Empty means one worker per role.
     workforce: dict[str, int] = field(default_factory=dict)
 
     # role -> WorkSchedule override. Falls back to the definition.
     schedules: dict[str, WorkSchedule] = field(default_factory=dict)
 
-    # Case arrivals.
-    #   "replay"    use each case's real arrival_time, when present.
-    #               Removes the arrival model as a confound: absolute-time
-    #               measures then reflect what the engine did with the
-    #               same demand the real system faced.
-    #   "synthetic" generate a Poisson process at mean_interarrival_s.
-    #               Only this mode makes the case-arrival measure a test
-    #               of anything.
+    # Case arrivals:
+    #   "replay"    each case's real arrival_time, when present
+    #   "synthetic" Poisson process at mean_interarrival_s
     arrival_mode: str = "replay"
     mean_interarrival_s: float = 3600.0
 
@@ -97,22 +67,17 @@ class EngineConfig:
     #   "distribution"  sample from the fitted log-normal
     duration_source: str = "complexity"
 
-    # Multiplicative lognormal noise on the resolved work time, as a
-    # coefficient of variation. 0.0 disables it. Covers the operational
-    # scatter no judgement can produce: interruptions, a phone call
-    # mid-task, a colleague stopping by.
+    # Multiplicative lognormal noise on work time, as a coefficient of
+    # variation (0.0 disables it).
     duration_noise_cv: float = 0.0
 
     # Safety limits
     max_steps_per_case: int = 20
     max_events: int = 10_000
 
-    # Write a checkpoint every N completed cases. A run of a few hundred
-    # cases is half an hour of LLM calls; losing it to a dropped
-    # connection or a closed terminal costs real money and time. The
+    # Write a checkpoint every N completed cases (0 disables). The
     # checkpoint holds every event produced so far, so a killed run can
-    # still be evaluated on the cases that did finish.
-    # Set to 0 to disable.
+    # still be evaluated on the cases that did finish (see recover.py).
     checkpoint_every: int = 10
 
     # LLM
@@ -120,22 +85,17 @@ class EngineConfig:
     ollama_base_url: str = "http://localhost:11434"
     temperature: float = 0.3
 
-    # Seconds to wait for one LLM call before giving up on it.
-    # Without an explicit value the client waits ten minutes and then
-    # retries twice, which looks like a frozen process. A stalled call
-    # is almost always a dead socket - Windows suspends the network
-    # adapter to save power when the window loses focus, and the TCP
-    # connection dies silently - so failing fast and retrying is both
-    # quicker and more likely to succeed than waiting.
+    # Seconds to wait for one LLM call before giving up on it. The
+    # client default is ten minutes, which looks like a frozen process.
+    # A stalled call is usually a dead socket (e.g. Windows suspending
+    # the network adapter), so failing fast and retrying is quicker.
     llm_timeout_s: float = 90.0
 
     # Retries inside the client, for transient HTTP failures.
     llm_max_retries: int = 2
 
-    # Retries at the engine level, around the whole step. Covers the
-    # case where every client retry also times out. A step that still
-    # fails after this is recorded as an error rather than silently
-    # turning the case into a rejection.
+    # Retries around the whole step. A step that still fails is recorded
+    # as an error, not a rejection.
     step_max_retries: int = 2
     step_retry_wait_s: float = 5.0
 
@@ -276,17 +236,8 @@ class SimulationEngine:
 
     def _schedule_arrivals(self, rng: np.random.Generator):
         """
-        Put every case on the event queue at its arrival time.
-
-        In "replay" mode each case's recorded arrival_time is used
-        verbatim, so the simulator faces the same demand, in the same
-        order, at the same moments as the real system. Nothing is
-        snapped to office hours - the real log already reflects whatever
-        submission pattern existed, including out-of-hours applications.
-
-        In "synthetic" mode arrivals are drawn from a Poisson process
-        and snapped into the submission window, which is the only option
-        available for generated cases.
+        Put every case on the event queue: real timestamps in "replay"
+        mode, a Poisson process snapped to office hours otherwise.
         """
         replay = self.config.arrival_mode == "replay"
         have_times = sum(1 for c in self.cases if c.get("arrival_time"))
@@ -377,17 +328,7 @@ class SimulationEngine:
     ) -> float:
         """
         Hands-on work time for one activity, per config.duration_source.
-
-        "complexity"   the agent rated this case 1-5; the engine
-                       multiplies the tool's anchor by that rating's
-                       factor. Judgement from the agent, scale from the
-                       reference log.
-        "llm"          the agent's own absolute estimate, used as given.
-        "distribution" a sample from the fitted log-normal.
-
-        Every branch records what the agent said, including the free
-        estimate it is never asked to act on, so calibration and
-        complexity discrimination can be reported separately.
+        Records the agent's rating and free estimate for later analysis.
         """
         source = self.config.duration_source
         seconds: float | None = None
@@ -538,13 +479,7 @@ class SimulationEngine:
     def _execute_with_retry(
         self, state: ProcessState, worker: AgentWorker, case_id: str,
     ) -> tuple[ProcessState, str | None, bool]:
-        """
-        Run one step, retrying transient failures.
-
-        Returns (state, next_role, failed). `failed` means every attempt
-        raised - the caller records the case as an error rather than
-        inventing an outcome for it.
-        """
+        """Run one step with retries. Returns (state, next_role, failed)."""
         last_error = None
 
         for attempt in range(self.config.step_max_retries + 1):
@@ -599,10 +534,7 @@ class SimulationEngine:
         wall_time = time.time() - t0
 
         if failed:
-            # A step that could not run is a failure of the simulation,
-            # not a decision by an agent. Marking it as a rejection would
-            # put a fabricated outcome in the event log and quietly bias
-            # every downstream measure.
+            # A failed step is missing data, not an agent decision.
             self._failed_cases.append(case_id)
             self._agent_pool.release(worker.worker_id)
             self._case_states[case_id] = merge_state(
@@ -786,23 +718,13 @@ class SimulationEngine:
     # -- Duration analysis ---------------------
 
     def duration_dataframe(self) -> pd.DataFrame:
-        """
-        One row per activity: what the agent said and what the engine
-        used. Columns:
-            tool, resolution, agent_typical, agent_complexity,
-            anchor, resolved_minutes, rationale
-        """
+        """One row per activity: what the agent said and what the engine used."""
         if not self._duration_samples:
             return pd.DataFrame()
         return pd.DataFrame(self._duration_samples)
 
     def duration_summary(self) -> pd.DataFrame:
-        """
-        Per-tool view of the two abilities being measured:
-
-            agent_typical vs anchor  absolute calibration
-            complexity spread        discrimination between cases
-        """
+        """Per-tool summary: free estimate vs anchor, and complexity spread."""
         df = self.duration_dataframe()
         if df.empty:
             return df
@@ -834,15 +756,7 @@ class SimulationEngine:
     # -- Export --------------------------------
 
     def _write_checkpoint(self) -> None:
-        """
-        Dump the events produced so far, overwriting the previous dump.
-
-        One rolling file rather than a numbered series: what matters is
-        being able to recover the current run, not to keep its history.
-        A failure here is logged and swallowed - losing a checkpoint is
-        an inconvenience, losing the run because the checkpoint raised
-        would be worse.
-        """
+        """Overwrite checkpoint.json with the events so far. Never raises."""
         if not self._global_event_log:
             return
 
@@ -866,12 +780,7 @@ class SimulationEngine:
             logger.warning("Could not write checkpoint: %s", e)
 
     def load_checkpoint(self, path: str | Path | None = None) -> dict | None:
-        """
-        Read a checkpoint back, for recovering a killed run.
-
-        The events can be exported to XES and evaluated exactly like a
-        completed run - the cases that finished are complete traces.
-        """
+        """Read a checkpoint back, for recovering a killed run."""
         path = Path(path) if path else self.output_dir / "checkpoint.json"
         if not path.exists():
             return None

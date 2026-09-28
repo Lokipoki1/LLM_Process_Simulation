@@ -1,5 +1,6 @@
 """
 senior_clerk.py
+---------------
 The SC starts with the same limited info as the JC, and can call
 CheckCreditScore to reveal the credit bureau data.
 """

@@ -1,11 +1,7 @@
 """
 events.py
 ---------
-Event types and priority queue for the discrete event simulation engine.
-
-The simulation is driven by events ordered by simulation time.
-Each event represents something that happens at a specific moment:
-a case arriving, an agent finishing a task, a shift starting/ending.
+Event types and the time-ordered priority queue that drives the engine.
 """
 
 from __future__ import annotations
@@ -24,12 +20,7 @@ class EventType(str, Enum):
 
 @dataclass(order=True)
 class SimEvent:
-    """
-    A single event in the discrete event simulation.
-
-    Events are ordered by time (earliest first). When two events have
-    the same time, priority breaks the tie (lower = higher priority).
-    """
+    """A simulation event, ordered by time, then priority (lower first)."""
     time: float                                        # simulation time (unix timestamp)
     priority: int        = field(compare=True)         # lower = processed first at same time
     event_type: EventType = field(compare=False)
@@ -44,12 +35,7 @@ class SimEvent:
 
 
 class EventQueue:
-    """
-    Priority queue for simulation events, ordered by time.
-
-    Wraps heapq for O(log n) push/pop. Events at the same time
-    are processed in priority order (shift > complete > arrival).
-    """
+    """Heap of events; ties go shift > complete > arrival."""
 
     def __init__(self):
         self._heap: list[SimEvent] = []
@@ -70,7 +56,7 @@ class EventQueue:
     def __len__(self) -> int:
         return len(self._heap)
 
-    # ── Convenience factories ──────────────────────
+    # -- Convenience factories -------------------
 
     def schedule_arrival(self, time: float, case_id: str, case_data: dict) -> None:
         self.push(SimEvent(

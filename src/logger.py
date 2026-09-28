@@ -5,7 +5,7 @@ Centralised logging setup for the BPS framework.
 
 Two handlers:
   - FileHandler  (DEBUG): output/<run>/debug.log  — always on, full detail
-  - StreamHandler (INFO or DEBUG): console — only with verbose=True
+  - StreamHandler (DEBUG): console         — only with verbose=True
 
 Usage:
     from src.logger import setup_logging
@@ -28,7 +28,7 @@ def setup_logging(output_dir: str = "output", verbose: bool = False) -> None:
     root.setLevel(logging.DEBUG)
     root.handlers.clear()
 
-    # ── File handler: always at DEBUG, full structured format ──────────
+    # -- File handler: always at DEBUG, full structured format ---
     log_path = Path(output_dir) / "debug.log"
     fh = logging.FileHandler(log_path, mode="w", encoding="utf-8")
     fh.setLevel(logging.DEBUG)
@@ -38,7 +38,7 @@ def setup_logging(output_dir: str = "output", verbose: bool = False) -> None:
     ))
     root.addHandler(fh)
 
-    # ── Console handler: only with --verbose ───────────────────────────
+    # -- Console handler: only with --verbose ----
     if verbose:
         ch = logging.StreamHandler(sys.stdout)
         ch.setLevel(logging.DEBUG)

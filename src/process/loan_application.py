@@ -1,21 +1,8 @@
 """
 loan_application.py
 -------------------
-The loan application process, as a single ProcessDefinition.
-
-Everything domain-specific about this simulation is either in this file
-or reachable from it: the three roles, who may hand a case to whom, the
-activity vocabulary, and how a raw case dict becomes a ProcessState.
-
-This is the reference instantiation. A second process would be a sibling
-module of the same shape - the engine in src/queue/ does not change.
-
-Reference log
-    BPI Challenge 2017, a Dutch bank's loan application process.
-    Case-level attributes are visible from the start; offer-level
-    attributes (credit score, monthly cost, terms) are only revealed
-    once the Senior Clerk queries the credit bureau, matching the point
-    in the real process where that data first appears.
+The loan application process (BPI Challenge 2017) as a ProcessDefinition:
+roles, routing, activity vocabulary and initial state.
 """
 
 from __future__ import annotations
@@ -34,13 +21,8 @@ from .definition import ProcessDefinition
 
 def make_loan_state(case_data: dict) -> ProcessState:
     """
-    Build the starting state for a loan case.
-
-    Splits the raw case into what the applicant submitted (visible
-    immediately) and what the bank later obtains from the credit bureau
-    (hidden until CheckCreditScore). That split is the information
-    asymmetry the simulation depends on: the Junior Clerk decides with an
-    incomplete picture, exactly as a real intake clerk does.
+    Build the starting state for a loan case. Credit bureau data stays
+    hidden until CheckCreditScore.
     """
     application = {
         "case_id":          case_data["case_id"],
@@ -67,24 +49,9 @@ def make_loan_state(case_data: dict) -> ProcessState:
 # -------------------------------------------------
 # Activity vocabulary
 # -------------------------------------------------
-# tool name -> XES activity label, using BPIC 2017's own vocabulary so
-# the synthetic log and the reference log share an alphabet. Without
-# that, any label-based distance (n-gram, directly-follows) compares
-# disjoint sets and reports maximum distance regardless of how faithful
-# the simulation is.
-#
-# The labels were inherited from BPIC 2012 (A_INTAKE, O_APPROVED, ...)
-# and never updated when the project moved datasets. These are the
-# BPIC 2017 equivalents.
-#
-# Reading the BPIC 2017 prefixes:
-#   A_  the state of the APPLICATION, as the bank sees it
-#   O_  the state of the OFFER, driven by what the CUSTOMER does with it
-#   W_  work items: what an employee actually performs
-#
-# The simulation has no customer actor, so no tool maps to an O_ label:
-# the Credit Officer decides whether the BANK lends, which is A_Pending
-# or A_Denied, not the customer accepting or refusing an offer.
+# tool name -> BPIC 2017 activity label, so both logs share an alphabet.
+# A_ = application state, O_ = offer state (customer-driven), W_ = work
+# item. There is no customer actor, so no tool maps to an O_ label.
 
 ACTIVITY_MAP: dict[str, str] = {
     # Junior Clerk
@@ -115,22 +82,9 @@ RESOURCE_MAP: dict[str, str] = {
 # -------------------------------------------------
 # Silent tools
 # -------------------------------------------------
-# Tools that advance the case without producing a log event.
-#
-# ForwardCase and EscalateCase are internal handovers. They change who
-# holds the file, but a bank's information system records activities,
-# not handoffs - there is no BPIC 2017 activity for "the junior clerk
-# passed this to the senior clerk".
-#
-# CheckCreditScore is information gathering. The credit score does exist
-# in BPIC 2017, but as an ATTRIBUTE of O_Create Offer, and offer
-# creation happens after the bank has decided to lend - later in the
-# process than the point where the Senior Clerk looks the score up.
-# Mapping it to O_Create Offer would put that activity before
-# validation, inverting the real order.
-#
-# Emitting all three inflates every trace by three events relative to
-# the reference log, which distorts trace-length and n-gram comparisons.
+# Tools that advance the case without producing a log event: the two
+# handovers have no BPIC 2017 activity, and the credit score only
+# appears there as an attribute of the later O_Create Offer.
 
 SILENT_TOOLS: frozenset[str] = frozenset({
     "ForwardCase",
@@ -142,9 +96,6 @@ SILENT_TOOLS: frozenset[str] = frozenset({
 # -------------------------------------------------
 # Routing
 # -------------------------------------------------
-# Which roles a case may move to from each role. A role that continues
-# its own multi-step sequence must list itself.
-#
 #   junior_clerk   -> itself (intake, docs) or the senior clerk (forward)
 #   senior_clerk   -> itself (bureau, validate), the credit officer
 #                     (escalate), or back to the junior clerk (rework)
@@ -185,11 +136,8 @@ LOAN_PROCESS = ProcessDefinition(
 # -------------------------------------------------
 # Reference: the full BPIC 2017 vocabulary
 # -------------------------------------------------
-# All 26 activities in the log, for checking coverage and for deciding
-# what a future, finer-grained instantiation might model. The simulation
-# currently produces 7 of these; the rest belong to steps it abstracts
-# away (lead handling, offer dispatch, customer response, fraud checks,
-# collection).
+# All 26 activities in the log, for checking label coverage. The
+# simulation produces 8 of them.
 
 BPIC_2017_ACTIVITIES: frozenset[str] = frozenset({
     # Application state
@@ -209,13 +157,7 @@ BPIC_2017_ACTIVITIES: frozenset[str] = frozenset({
 
 
 def check_mapping_coverage() -> dict:
-    """
-    Which emitted labels exist in the reference log, and which do not.
-
-    Run this after changing ACTIVITY_MAP. Any label reported as unknown
-    will have no counterpart in the reference log and will contribute
-    maximum distance to every label-based metric.
-    """
+    """Which emitted labels exist in the reference log. Run after changing ACTIVITY_MAP."""
     emitted = {
         label for tool, label in ACTIVITY_MAP.items()
         if tool not in SILENT_TOOLS

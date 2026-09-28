@@ -1,27 +1,16 @@
 """
 process_graph.py
 ----------------
-LangGraph process definition + single-step execution.
+LEGACY - not imported by the engine, and does not import as it stands
+(it references `observer.observer_node`, which no longer exists).
 
-This module defines the loan application process as a LangGraph
-StateGraph (the BPMN-equivalent directed graph), and exposes a
-step-by-step interface that the DES engine can call.
+Superseded by:
+  - src/process/loan_application.py  the process definition
+  - src/queue/step_executor.py       single-step execution
 
-Architecture split:
-  - LangGraph:  owns the process TOPOLOGY (nodes, edges, routing)
-  - DES engine: owns the TEMPORAL orchestration (queues, schedules, clock)
-
-IMPORTANT — clock ownership:
-  `execute_step()` performs the agent's LLM call and merges the resulting
-  state, but it does NOT advance any clock and does NOT emit XES entries.
-  The DES engine is the single source of truth for simulation time: it
-  samples the activity duration, schedules the completion event, and
-  stamps the resulting XES entry with the real DES timestamp.
-
-  Previously the observer was called here as well, which meant every step
-  sampled its duration twice (once here, once in the engine) and the XES
-  timestamps came from a global monotonic counter that knew nothing about
-  queues or parallel workers. That made AED/CTD meaningless.
+Kept as a record of the loan process expressed as a LangGraph
+StateGraph (the BPMN-equivalent directed graph), whose routing
+semantics the DES engine replicates.
 """
 
 from __future__ import annotations
@@ -30,7 +19,7 @@ from functools import partial
 from langgraph.graph import StateGraph, START, END
 
 from ..state import ProcessState
-from ..agents.junior_clerk_ import JuniorClerk
+from ..agents.junior_clerk import JuniorClerk
 from ..agents.senior_clerk import SeniorClerk
 from ..agents.credit_officer import CreditOfficer
 from ..observer.observer import observer_node
@@ -41,9 +30,9 @@ logger = logging.getLogger("bps.process_graph")
 MAX_STEPS = 20
 
 
-# ─────────────────────────────────────────────
+# -------------------------------------------------
 # Routing logic (the conditional edges / BPMN gateways)
-# ─────────────────────────────────────────────
+# -------------------------------------------------
 
 def route(state: ProcessState) -> str:
     """
@@ -77,33 +66,15 @@ def increment_rework(state: ProcessState) -> dict:
     return {"rework_count": state["rework_count"] + 1}
 
 
-# ─────────────────────────────────────────────
+# -------------------------------------------------
 # Graph builder (documentation / visualisation artifact)
-# ─────────────────────────────────────────────
+# -------------------------------------------------
 
 def build_process_graph(
     llm,
     clock: SimulationClock | None = None,
 ) -> "CompiledGraph":
-    """
-    Build the LangGraph StateGraph that defines the loan process.
-
-    This compiled graph is NOT used by the DES engine at runtime — its
-    run-to-completion execution model (`invoke()` runs a whole case) is
-    incompatible with discrete event simulation, where several cases run
-    concurrently sharing the same agent resources.
-
-    It is kept as the formal, inspectable definition of the process
-    topology: it can be rendered to a diagram and it documents the
-    routing semantics that the DES engine replicates.
-
-    Args:
-        llm:   the LangChain LLM instance (shared by all agents)
-        clock: SimulationClock for the observer node
-
-    Returns:
-        Compiled LangGraph
-    """
+    """Build the LangGraph StateGraph of the loan process (not used at runtime)."""
     if clock is None:
         clock = SimulationClock()
 
@@ -145,26 +116,12 @@ def build_process_graph(
     return compiled
 
 
-# ─────────────────────────────────────────────
+# -------------------------------------------------
 # Single-step executor (used by the DES engine)
-# ─────────────────────────────────────────────
+# -------------------------------------------------
 
 class ProcessStepExecutor:
-    """
-    Executes ONE agent step at a time, so the DES engine can interleave
-    multiple cases across shared workers.
-
-    Responsibilities:
-      - call the right agent for the role
-      - merge the agent's partial update into the case state
-        (replicating LangGraph's operator.add semantics)
-      - resolve which role handles the next step
-
-    NOT its responsibility:
-      - advancing simulation time
-      - emitting XES entries
-    Both belong to the DES engine.
-    """
+    """Legacy single-step executor; see step_executor.StepExecutor."""
 
     def __init__(self, llm):
         self._agents = {
@@ -176,17 +133,7 @@ class ProcessStepExecutor:
     def execute_step(
         self, state: ProcessState, role: str
     ) -> tuple[ProcessState, str | None]:
-        """
-        Execute one step: the agent acts, the state is merged.
-
-        Args:
-            state: current ProcessState for this case
-            role:  which agent role should act
-
-        Returns:
-            (updated_state, next_role)
-            next_role is None if the case is complete.
-        """
+        """Execute one step. Returns (updated_state, next_role)."""
         agent = self._agents.get(role)
         if not agent:
             logger.error("Unknown role: %s", role)
@@ -208,13 +155,10 @@ class ProcessStepExecutor:
         # 4. Determine next role (replicating route())
         next_role = _resolve_next_role(state)
 
-        # NOTE: no clock advance and no XES entry here — the DES engine
-        # stamps the timestamp once it knows when the activity finished.
-
         return state, next_role
 
 
-# ── State merge (replicates LangGraph's operator.add) ──
+# -- State merge (replicates LangGraph's operator.add) ---
 
 _APPEND_FIELDS = {"messages", "agent_history", "event_log"}
 
@@ -243,19 +187,12 @@ def _resolve_next_role(state: ProcessState) -> str | None:
     return None
 
 
-# ─────────────────────────────────────────────
+# -------------------------------------------------
 # Initial state factory
-# ─────────────────────────────────────────────
+# -------------------------------------------------
 
 def make_initial_state(application: dict, credit_data: dict | None = None) -> ProcessState:
-    """
-    Create the initial state for a case.
-
-    application: LoanApplication fields
-                 (case_id, amount_requested, loan_goal, application_type)
-    credit_data: CreditBureauData fields — hidden until the SC checks;
-                 None for cases the bank never took to the offer stage.
-    """
+    """Create the initial state for a case."""
     return ProcessState(
         application=application,
         credit_bureau_data=credit_data,

@@ -1,24 +1,11 @@
 """
 agent_pool.py
 -------------
-Resource pool: workers, their schedules, and ROLE-LEVEL work queues.
+Resource pool: workers, their schedules, and one shared FIFO queue per
+role (M/M/c style - any idle worker of the role takes the next case).
 
-Queueing model
-    One FIFO queue per ROLE, not per worker. Any idle worker of that role
-    claims the next case from the shared queue. This is the standard M/M/c
-    model: a single line feeding c servers.
-
-    The previous per-worker model assigned a case to a specific worker at
-    enqueue time, so a case could sit behind a long task while a colleague
-    of the same role went idle. Role queues remove that head-of-line
-    blocking and produce shorter, more realistic waiting times.
-
-Shift-aware work
-    compute_finish_time() spreads an activity's work time across the
-    available shift windows. Work started at 16:50 that needs 2 hours
-    consumes the 10 minutes left today and resumes at 08:00 tomorrow,
-    finishing at 09:50. This keeps every event timestamp inside office
-    hours, which is what the BPIC logs show and what AED/CED measure.
+compute_finish_time() spreads work across shift windows: 2 hours started
+at 16:50 uses the 10 minutes left today and finishes at 09:50 tomorrow.
 """
 
 from __future__ import annotations
@@ -95,12 +82,8 @@ def compute_finish_time(
     max_iterations: int = 60,
 ) -> float:
     """
-    Spread `work_seconds` of hands-on work across the schedule's shift
-    windows starting at `start`. Returns the sim time the work finishes.
-
-    Work never happens outside shift hours or on days off: an activity
-    that does not fit in the remaining shift is suspended at end of day
-    and resumed at the next shift start.
+    Spread `work_seconds` of work across shift windows starting at
+    `start`, and return the finish time.
     """
     if work_seconds <= 0:
         return start
@@ -132,14 +115,7 @@ def compute_finish_time(
 
 @dataclass
 class AgentWorker:
-    """
-    A single resource instance. One role can have several workers
-    (e.g. 2 junior clerks, 1 senior clerk, 1 credit officer).
-
-    A worker holds no queue of its own - it claims cases from the shared
-    role queue. Agent behaviour lives in the StepExecutor; a worker is a
-    resource with a schedule and a busy flag.
-    """
+    """A single resource: a role, a schedule and a busy flag."""
     worker_id: str
     role: str
     schedule: WorkSchedule
@@ -211,12 +187,8 @@ class AgentPool:
 
     def claim_next(self, sim_time: float) -> tuple[AgentWorker, str] | None:
         """
-        Find an idle, on-shift worker whose role has work waiting, and hand
-        it the head of that role's queue.
-
-        Side effect: the case is REMOVED from the queue and the worker is
-        marked busy. Returns (worker, case_id), or None if nothing can be
-        dispatched right now.
+        Give the head of a role's queue to an idle, on-shift worker of that
+        role and mark it busy. Returns (worker, case_id) or None.
         """
         for role, queue in self._role_queues.items():
             if not queue:
@@ -236,11 +208,7 @@ class AgentPool:
     # -- Shift coordination --------------------
 
     def workers_needing_shift_wakeup(self, sim_time: float) -> list[AgentWorker]:
-        """
-        Idle, off-shift workers whose role has cases waiting. The engine
-        schedules a SHIFT_START for each so the queue is not orphaned when
-        everyone goes home.
-        """
+        """Idle, off-shift workers whose role has cases waiting."""
         out = []
         for role, queue in self._role_queues.items():
             if not queue:

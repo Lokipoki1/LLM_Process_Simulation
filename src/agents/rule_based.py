@@ -3,29 +3,10 @@ rule_based.py
 -------------
 Deterministic baseline agents: same tools, same routing, no LLM.
 
-Why this exists
----------------
-The framework claims that LLM agents contribute something a decision
-table cannot. That claim is not verifiable by reading the code - the
-only way to test it is to run an identical simulation whose agents
-decide by explicit rules, and compare the two event logs.
-
-These classes are drop-in replacements for the LLM agents. They expose
-the same tool schemas, produce the same AgentAction records, and return
-the same routing decisions, so the engine cannot tell the difference.
-Everything that differs between the two runs comes from how the next
-tool and its arguments are chosen.
-
-Fairness of the comparison
---------------------------
-A baseline is only informative if it is a serious opponent. These rules
-encode every criterion the agent prompts state, including the vague-goal
-check that a first version of this file missed: the LLM arm returned
-five cases early because their LoanGoal was "Other, see explanation" or
-"Unknown", and the rules had no equivalent test, which made the two arms
-diverge for a reason that had nothing to do with reasoning.
-
-Where the rules still lose ground, that gap is the finding.
+Drop-in replacements for the LLM agents, used to test what the LLM
+contributes over a decision table. They cover every criterion the
+prompts describe, and replace the prompts' judgement calls with the
+explicit thresholds below.
 """
 
 from __future__ import annotations
@@ -42,7 +23,7 @@ logger = logging.getLogger("bps.rule_agent")
 
 
 # -------------------------------------------------
-# Thresholds - mirrors of what the prompts state
+# Thresholds - explicit stand-ins for the prompts' judgement calls
 # -------------------------------------------------
 
 HIGH_AMOUNT = 50_000        # priority="high" above this
@@ -60,13 +41,7 @@ def is_vague_goal(goal: str) -> bool:
 
 
 class RuleBasedAgent:
-    """
-    Base for deterministic agents.
-
-    Mirrors BaseAgent's interface: callable with a ProcessState, returns
-    the same partial-update dict. It never calls an LLM and never binds
-    tools - it picks the next tool from the case state directly.
-    """
+    """Base for deterministic agents, with the same interface as BaseAgent."""
 
     name: str = "rule_agent"
     tool_schemas: list = []
@@ -84,13 +59,7 @@ class RuleBasedAgent:
         ]
 
     def _tools_since_rework(self, state: ProcessState) -> list[str]:
-        """
-        Tools this agent used since the most recent RequestAdditionalInfo.
-
-        Counting from the last rework rather than from the start is what
-        lets a role repeat its full sequence on a second visit, instead
-        of skipping steps it already performed on the first pass.
-        """
+        """Tools this agent used since the most recent RequestAdditionalInfo."""
         history = state["agent_history"]
         start = 0
         for i, a in enumerate(history):
@@ -151,11 +120,7 @@ class RuleBasedAgent:
 class RuleJuniorClerk(RuleBasedAgent):
     """
     Sequence: IntakeApplication -> CheckDocuments -> forward or return.
-
-    Returns a case early when the request is internally implausible or
-    when the stated purpose is not a purpose at all. The clerk cannot
-    see a credit score, so it can only judge the application against
-    itself - which is exactly the bar the prompt sets.
+    Returns cases with a vague goal or an implausible amount.
     """
 
     name = "junior_clerk"
@@ -276,10 +241,7 @@ class RuleSeniorClerk(RuleBasedAgent):
     """
     Sequence: CheckCreditScore -> ValidateApplication -> escalate or rework.
 
-    Requests rework once when the bureau returned nothing, which is the
-    condition the prompt names first. On the second visit the bureau data
-    has not changed, so the file is escalated with what is available -
-    asking again would stall the case indefinitely.
+    Requests rework once when the bureau returned no score, then escalates.
     """
 
     name = "senior_clerk"
@@ -373,8 +335,8 @@ class RuleCreditOfficer(RuleBasedAgent):
     """
     Sequence: AssessRisk -> approve or reject.
 
-    Decides on the credit score bands the prompt describes, and follows
-    the senior clerk's recommendation on genuinely borderline files.
+    Decides on fixed credit score bands (GOOD_SCORE / POOR_SCORE), and
+    follows the senior clerk's recommendation on borderline files.
     """
 
     name = "credit_officer"

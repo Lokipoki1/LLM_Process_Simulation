@@ -1,31 +1,13 @@
 """
 schemas.py
 ----------
-Pydantic tools for each agent role.
+Pydantic tools for each agent role. Class docstrings are sent to the
+LLM as tool descriptions.
 
-Information asymmetry
-  - JC tools: only application data (amount, goal, type)
-  - SC tools: include CheckCreditScore, which reveals bureau data
-  - CO tools: full information (application + credit + handoff history)
-
-Timing fields
-  Every tool carries three fields about the work just performed:
-
-    typical_duration_minutes  the agent's unanchored estimate of how
-                              long this KIND of task usually takes
-    complexity_rationale      one sentence on what made THIS case easy
-                              or hard, written before the rating
-    case_complexity           1-5 rating of this case against the usual
-
-  Only case_complexity advances the simulation clock: the engine
-  multiplies a reference anchor by the complexity multiplier. The free
-  estimate is recorded but never used, so the model's unaided
-  calibration can be reported separately from its ability to
-  discriminate complexity between cases.
-
-  The rationale sits before the rating on purpose. Filling a bare
-  numeric field invites pattern completion; writing the justification
-  first forces the judgement to be made before the number is emitted.
+Every tool ends with three timing fields: typical_duration_minutes
+(recorded only), complexity_rationale, and case_complexity (drives the
+clock). The rationale comes before the rating so the judgement is
+written before the number.
 """
 
 from __future__ import annotations

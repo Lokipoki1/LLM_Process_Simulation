@@ -1,6 +1,10 @@
 """
-base_agent.py — information asymmetry
-─────────────────────────────────────
+base_agent.py
+-------------
+Shared behaviour of the LLM agents: bind the role's tools, build the
+case context, make one LLM call, and turn the chosen tool call into an
+AgentAction plus a routing decision.
+
 The context builder enforces information asymmetry:
   - JC: sees application data only
   - SC: sees application + credit bureau data (after CheckCreditScore)
@@ -67,7 +71,7 @@ class BaseAgent:
             available = self._all_lc_tools
         return self._base_llm.bind_tools(available)
 
-    # ── Handoff narrative ─────────────────────
+    # -- Handoff narrative -----------------------
 
     def _build_handoff_context(self, state: ProcessState) -> str:
         """Narrative summary of every prior agent action, in their own words."""
@@ -106,7 +110,7 @@ class BaseAgent:
 
         return "\n".join(lines) if lines else "No prior actions."
 
-    # ── Information-asymmetric context ────────
+    # -- Information-asymmetric context ----------
 
     def _build_case_context(self, state: ProcessState) -> str:
         """
@@ -158,7 +162,7 @@ class BaseAgent:
 
         return context
 
-    # ── Main execution ────────────────────────
+    # -- Main execution --------------------------
 
     def __call__(self, state: ProcessState) -> dict:
         _log = logging.getLogger(f"bps.{self.name}")

@@ -1,5 +1,6 @@
 """
 credit_officer.py
+-----------------
 The CO sees everything: application + credit data + all prior reasoning.
 """
 

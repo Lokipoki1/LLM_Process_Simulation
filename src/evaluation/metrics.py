@@ -1,47 +1,17 @@
 """
 metrics.py
 ----------
-Log-distance measures between a synthetic log and a reference log.
+Log-distance measures between a synthetic log and a reference log
+(Chapela-Campa et al., Information Systems 127, 2025).
 
-These are the metrics established for business process simulation
-quality by Chapela-Campa et al., "A framework for measuring the quality
-of business process simulation models" (Information Systems 127, 2025;
-BPM 2023). They compare EVENT LOGS rather than models, which is what
-makes them usable here: the reference process has no published model,
-and two simulators rarely share a representation.
+    control-flow    NGD - n-gram distance over activity sequences
+    temporal        AED, CED, RED - absolute, circadian and relative
+                    event distributions
+    congestion      CAR, CTD - case arrivals and cycle time
 
-Three perspectives, and what each one tests in this engine:
-
-    control-flow    n-gram distance over activity sequences.
-                    Tests whether the agents route cases the way the
-                    real process routes them.
-
-    temporal        absolute, circadian and relative event
-                    distributions. Relative is the sharpest test of the
-                    engine: it measures when events happen RELATIVE to
-                    case arrival, so it is sensitive to activity
-                    durations, queue waiting and shift suspension all at
-                    once.
-
-    congestion      case arrival rate and cycle time distribution.
-                    Cycle time aggregates processing, waiting and
-                    resource availability, making it the single best
-                    summary of whether the queueing model behaves.
-
-On interpreting the numbers
-    N-gram distance is normalised to [0, 1] and is comparable across
-    studies. The distribution measures are Earth Mover's Distance in
-    units of the discretisation bin (hours here) divided by the number
-    of observations, so a value of 10 means "on average each observation
-    sat 10 hours away from where the reference log put it". Those are
-    NOT comparable across papers unless the binning, the log size and
-    the normalisation all match.
-
-On running more than once
-    A simulation is stochastic and the reference log is a single
-    realisation, so one run gives one draw from a distribution of
-    possible distances. The convention is to simulate K times and report
-    the mean with a confidence interval; aggregate_runs() does that.
+NGD is in [0, 1]. The distribution measures are EMD in hours per
+observation, comparable only within the same setup. aggregate_runs()
+reports mean and CI over several runs.
 """
 
 from __future__ import annotations
@@ -137,17 +107,7 @@ def _safe(name: str, perspective: str, fn) -> MetricResult:
 def control_flow_metrics(
     reference: pd.DataFrame, simulated: pd.DataFrame, n: int = 2,
 ) -> list[MetricResult]:
-    """
-    N-gram distance over activity sequences.
-
-    n=2 is the value used in the literature: the bigram histogram of a
-    log is its directly-follows graph, which the authors found carries
-    enough control-flow information for models without duplicate
-    activities. An n-gram present in only one log contributes its full
-    frequency, so differing vocabularies are handled without special
-    casing - which also means an unfiltered vocabulary mismatch will
-    dominate the result.
-    """
+    """N-gram distance over activity sequences (n=2: directly-follows)."""
     require_package()
     return [
         _safe(
@@ -162,14 +122,7 @@ def control_flow_metrics(
 def control_flow_log_distance_metric(
     reference: pd.DataFrame, simulated: pd.DataFrame, seed: int = 42,
 ) -> MetricResult:
-    """
-    Optimal-matching distance between traces.
-
-    Requires equal case counts and is expensive - cubic in the number of
-    cases. The framework authors report a rank correlation of 1.0 with
-    n-gram distance and recommend the latter, so this is optional and
-    off by default.
-    """
+    """Optimal-matching trace distance. Slow (cubic in cases); off by default."""
     require_package()
     ref, sim = align_case_counts(reference, simulated, seed)
     return _safe(
@@ -181,12 +134,7 @@ def control_flow_log_distance_metric(
 def temporal_metrics(
     reference: pd.DataFrame, simulated: pd.DataFrame,
 ) -> list[MetricResult]:
-    """
-    Absolute, circadian and relative event distributions.
-
-    All three use both timestamps of every event. A log carrying only
-    completion times makes them measure half of what they should.
-    """
+    """Absolute, circadian and relative event distributions (start and end)."""
     require_package()
     both = AbsoluteTimestampType.BOTH
 
@@ -249,12 +197,7 @@ def evaluate_log(
     include_cfld: bool = False,
     seed: int = 42,
 ) -> pd.DataFrame:
-    """
-    Compute the full metric set for one simulated log.
-
-    Returns a frame with one row per measure: name, perspective, value,
-    and a note when a measure could not be computed.
-    """
+    """Compute the full metric set for one simulated log, one row per measure."""
     require_package()
 
     results: list[MetricResult] = []
@@ -276,14 +219,7 @@ def evaluate_log(
 
 
 def aggregate_runs(run_results: list[pd.DataFrame], confidence: float = 0.95) -> pd.DataFrame:
-    """
-    Mean and confidence interval across K simulation runs.
-
-    A single run is one draw from a distribution: the simulation is
-    stochastic, and with LLM agents it is stochastic even at temperature
-    zero. Reporting one number hides that. The convention in this
-    literature is K=10 runs with a confidence interval.
-    """
+    """Mean and confidence interval across K simulation runs."""
     if not run_results:
         return pd.DataFrame()
 
@@ -331,13 +267,7 @@ def aggregate_runs(run_results: list[pd.DataFrame], confidence: float = 0.95) ->
 def variant_comparison(
     reference: pd.DataFrame, simulated: pd.DataFrame, top_k: int = 10,
 ) -> pd.DataFrame:
-    """
-    Most frequent trace variants in each log, side by side.
-
-    Distances say how far apart two logs are; this says where. A variant
-    the simulation produces often and the reference never produces is
-    visible here and invisible in a single scalar.
-    """
+    """Most frequent trace variants in each log, side by side."""
     def variants(df, label):
         v = df.groupby(CASE_ID)[ACTIVITY].apply(lambda s: " -> ".join(s))
         counts = v.value_counts()

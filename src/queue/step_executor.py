@@ -1,28 +1,12 @@
 """
 step_executor.py
 ----------------
-Executes ONE agent step at a time so the DES engine can interleave
-multiple cases across shared workers.
+Executes ONE agent step at a time so the engine can interleave cases.
 
-Agents and routing rules come from a ProcessDefinition, so this module
-contains no domain knowledge: it does not know what a loan is, only that
-some role acts and the case then moves somewhere.
-
-Responsibilities
-  - call the agent registered for a role
-  - merge the agent's partial update into the case state
-  - maintain the rework counter
-  - resolve which role handles the next step
-
-Not its responsibility
-  - advancing simulation time
-  - emitting XES entries
-Both belong to the engine, the single owner of the timeline.
-
-LangGraph was evaluated as the orchestrator and removed: its
-run-to-completion model (`graph.invoke()` runs a whole case start to
-finish) is incompatible with discrete event simulation, where cases
-advance concurrently while competing for a limited pool of resources.
+Calls the role's agent, merges its update into the case state, counts
+rework, and resolves the next role. Time and XES output belong to the
+engine. Replaces LangGraph, whose run-to-completion model does not fit
+discrete event simulation.
 """
 
 from __future__ import annotations
@@ -49,13 +33,7 @@ def merge_state(current: ProcessState, partial: dict) -> ProcessState:
 
 
 class StepExecutor:
-    """
-    Holds one agent instance per role and runs a single step on demand.
-
-    Agents are shared across all workers of the same role: junior_clerk_1
-    and junior_clerk_2 are two resources drawing on the same persona, the
-    way two clerks follow the same job description.
-    """
+    """Holds one agent per role (shared by its workers) and runs single steps."""
 
     def __init__(self, llm, process: ProcessDefinition):
         self.process = process
@@ -65,12 +43,7 @@ class StepExecutor:
         }
 
     def resolve_next_role(self, state: ProcessState) -> str | None:
-        """
-        Which role handles the next step, or None if the case is finished.
-
-        An agent that returns next_agent=None on an open case is
-        continuing its own sequence.
-        """
+        """Next role, or None if the case is finished. next_agent=None means the same role continues."""
         if state["status"] in ("approved", "rejected"):
             return None
 
